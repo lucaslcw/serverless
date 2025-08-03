@@ -1,5 +1,6 @@
 import { SQSEvent } from "aws-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import {
   DynamoDBDocumentClient,
   QueryCommand,
@@ -15,15 +16,30 @@ import {
 } from "../../shared/logger";
 
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 const LEAD_TABLE_NAME = process.env.LEAD_COLLECTION_TABLE!;
 const ORDER_TABLE_NAME = process.env.ORDER_COLLECTION_TABLE!;
 const PRODUCT_TABLE_NAME = process.env.PRODUCT_COLLECTION_TABLE!;
+const PRODUCT_STOCK_QUEUE_URL = process.env.PRODUCT_STOCK_QUEUE_URL!;
 
 enum OrderStatus {
   PENDING = "PENDING",
-  PROCESSED = "PROCESSED"
+  PROCESSED = "PROCESSED",
+}
+
+enum StockOperationType {
+  DECREASE = "DECREASE",
+  INCREASE = "INCREASE",
+}
+
+interface StockUpdateMessage {
+  productId: string;
+  quantity: number;
+  operation: StockOperationType;
+  orderId?: string;
+  reason?: string;
 }
 
 interface OrderItem {
@@ -133,55 +149,87 @@ export const handler = async (event: SQSEvent): Promise<void> => {
 
       orderLogger.info("Starting order creation logic");
 
-      const enrichedItems = await enrichOrderItems(message.items || [], orderLogger);
-
-      const totalValue = enrichedItems.reduce((total: number, item: OrderItem) => total + (item.totalPrice || 0), 0);
-
-      await updateProductsStock(enrichedItems, orderLogger);
-
-      const leadId = await findOrCreateLead(
-        message.email,
-        message.cpf,
-        message.name,
-        message.orderId,
+      const enrichedItems = await enrichOrderItems(
+        message.items || [],
         orderLogger
       );
 
-      const orderRecord: OrderRecord = {
-        orderId: message.orderId,
-        leadId: leadId,
-        customerCpf: message.cpf,
-        customerEmail: message.email,
-        customerName: message.name,
-        items: enrichedItems,
-        totalItems: enrichedItems.reduce(
-          (total: number, item: OrderItem) => total + item.quantity,
-          0
-        ),
-        totalValue: totalValue,
-        status: OrderStatus.PENDING,
-        source: "order-processing-service",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
+      const totalValue = enrichedItems.reduce(
+        (total: number, item: OrderItem) => total + (item.totalPrice || 0),
+        0
+      );
 
-      await createOrderInDatabase(orderRecord, orderLogger);
+      const stockUpdatedItems: OrderItem[] = [];
 
-      processingTracker.finish({
-        newStatus: orderRecord.status,
-        totalItems: orderRecord.totalItems,
-        totalValue: orderRecord.totalValue,
-        leadId: leadId,
-        leadAction: "associated",
-      });
+      try {
+        await updateProductsStock(
+          enrichedItems,
+          orderLogger,
+          stockUpdatedItems
+        );
 
-      orderLogger.info("Order created successfully", {
-        newStatus: orderRecord.status,
-        totalItems: orderRecord.totalItems,
-        totalValue: orderRecord.totalValue,
-        leadId: leadId,
-        leadRequired: true,
-      });
+        const leadId = await findOrCreateLead(
+          message.email,
+          message.cpf,
+          message.name,
+          message.orderId,
+          orderLogger
+        );
+
+        const orderRecord: OrderRecord = {
+          orderId: message.orderId,
+          leadId: leadId,
+          customerCpf: message.cpf,
+          customerEmail: message.email,
+          customerName: message.name,
+          items: enrichedItems,
+          totalItems: enrichedItems.reduce(
+            (total: number, item: OrderItem) => total + item.quantity,
+            0
+          ),
+          totalValue: totalValue,
+          status: OrderStatus.PENDING,
+          source: "order-processing-service",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+
+        await createOrderInDatabase(orderRecord, orderLogger);
+
+        processingTracker.finish({
+          newStatus: orderRecord.status,
+          totalItems: orderRecord.totalItems,
+          totalValue: orderRecord.totalValue,
+          leadId: leadId,
+          leadAction: "associated",
+        });
+
+        orderLogger.info("Order created successfully", {
+          newStatus: orderRecord.status,
+          totalItems: orderRecord.totalItems,
+          totalValue: orderRecord.totalValue,
+          leadId: leadId,
+          leadRequired: true,
+        });
+      } catch (orderError) {
+        if (stockUpdatedItems.length > 0) {
+          orderLogger.warn(
+            "Order creation failed, sending stock rollback messages",
+            {
+              stockUpdatedItemsCount: stockUpdatedItems.length,
+              orderId: message.orderId,
+            }
+          );
+
+          await sendStockRollbackMessages(
+            stockUpdatedItems,
+            message.orderId,
+            orderLogger
+          );
+        }
+
+        throw orderError;
+      }
 
       recordTracker.finish({
         orderId: message.orderId,
@@ -191,8 +239,6 @@ export const handler = async (event: SQSEvent): Promise<void> => {
       recordLogger.error("Error processing order record", error, {
         sqsMessagePreview: record.body.substring(0, 200),
       });
-
-      // TODO: Enviar para a fila de estoque para retornar os produtos que foram baixados
 
       recordTracker.finishWithError(error);
 
@@ -479,7 +525,7 @@ async function enrichOrderItems(
   try {
     logger.info("Starting order items enrichment", {
       itemsCount: items.length,
-      itemIds: items.map(item => item.id)
+      itemIds: items.map((item) => item.id),
     });
 
     const enrichedItems: OrderItem[] = [];
@@ -494,10 +540,12 @@ async function enrichOrderItems(
               productId: item.id,
               productName: product.name,
               requestedQuantity: item.quantity,
-              availableStock: product.quantityInStock
+              availableStock: product.quantityInStock,
             });
 
-            throw new Error(`Insufficient stock for product ${product.name}. Requested: ${item.quantity}, Available: ${product.quantityInStock}`);
+            throw new Error(
+              `Insufficient stock for product ${product.name}. Requested: ${item.quantity}, Available: ${product.quantityInStock}`
+            );
           }
         }
 
@@ -507,7 +555,7 @@ async function enrichOrderItems(
           productName: product.name,
           unitPrice: product.price,
           totalPrice: product.price * item.quantity,
-          hasStockControl: product.quantityInStock !== undefined
+          hasStockControl: product.quantityInStock !== undefined,
         };
 
         enrichedItems.push(enrichedItem);
@@ -519,12 +567,12 @@ async function enrichOrderItems(
           unitPrice: product.price,
           totalPrice: enrichedItem.totalPrice,
           hasStockControl: product.quantityInStock !== undefined,
-          availableStock: product.quantityInStock
+          availableStock: product.quantityInStock,
         });
       } else {
         logger.warn("Product not found, using basic item data", {
           productId: item.id,
-          quantity: item.quantity
+          quantity: item.quantity,
         });
 
         enrichedItems.push({
@@ -533,26 +581,32 @@ async function enrichOrderItems(
           productName: "Unknown Product",
           unitPrice: 0,
           totalPrice: 0,
-          hasStockControl: false
+          hasStockControl: false,
         });
       }
     }
 
     enrichmentTracker.finish({
       totalItems: enrichedItems.length,
-      totalValue: enrichedItems.reduce((total: number, item: OrderItem) => total + (item.totalPrice || 0), 0)
+      totalValue: enrichedItems.reduce(
+        (total: number, item: OrderItem) => total + (item.totalPrice || 0),
+        0
+      ),
     });
 
     logger.info("Order items enrichment completed", {
       enrichedItemsCount: enrichedItems.length,
-      totalValue: enrichedItems.reduce((total: number, item: OrderItem) => total + (item.totalPrice || 0), 0)
+      totalValue: enrichedItems.reduce(
+        (total: number, item: OrderItem) => total + (item.totalPrice || 0),
+        0
+      ),
     });
 
     return enrichedItems;
   } catch (error) {
     logger.error("Error enriching order items", error, {
       itemsCount: items.length,
-      itemIds: items.map(item => item.id)
+      itemIds: items.map((item) => item.id),
     });
 
     enrichmentTracker.finishWithError(error);
@@ -564,25 +618,23 @@ async function getProductById(
   productId: string,
   logger: any
 ): Promise<Product | null> {
-  const productTracker = new PerformanceTracker(
-    logger,
-    "product-lookup"
-  );
+  const productTracker = new PerformanceTracker(logger, "product-lookup");
 
   try {
     logger.info("Looking up product", {
-      productId: productId
+      productId: productId,
     });
 
     const getCommand = new GetCommand({
       TableName: PRODUCT_TABLE_NAME,
       Key: {
-        productId: productId
+        productId: productId,
       },
-      ProjectionExpression: "productId, #name, price, category, description, isActive, quantityInStock",
+      ProjectionExpression:
+        "productId, #name, price, category, description, isActive, quantityInStock",
       ExpressionAttributeNames: {
-        "#name": "name"
-      }
+        "#name": "name",
+      },
     });
 
     const result = await docClient.send(getCommand);
@@ -595,19 +647,19 @@ async function getProductById(
         category: result.Item.category as string,
         description: result.Item.description as string,
         isActive: result.Item.isActive as boolean,
-        quantityInStock: result.Item.quantityInStock as number | undefined
+        quantityInStock: result.Item.quantityInStock as number | undefined,
       };
 
       if (!product.isActive) {
         logger.warn("Product found but is inactive", {
           productId: productId,
-          productName: product.name
+          productName: product.name,
         });
-        
+
         productTracker.finish({
           productId: productId,
           found: true,
-          active: false
+          active: false,
         });
 
         return null;
@@ -619,7 +671,7 @@ async function getProductById(
         price: product.price,
         category: product.category,
         hasStockControl: product.quantityInStock !== undefined,
-        quantityInStock: product.quantityInStock
+        quantityInStock: product.quantityInStock,
       });
 
       productTracker.finish({
@@ -627,25 +679,25 @@ async function getProductById(
         found: true,
         active: true,
         price: product.price,
-        hasStockControl: product.quantityInStock !== undefined
+        hasStockControl: product.quantityInStock !== undefined,
       });
 
       return product;
     } else {
       logger.warn("Product not found", {
-        productId: productId
+        productId: productId,
       });
 
       productTracker.finish({
         productId: productId,
-        found: false
+        found: false,
       });
 
       return null;
     }
   } catch (error) {
     logger.error("Error looking up product", error, {
-      productId: productId
+      productId: productId,
     });
 
     productTracker.finishWithError(error);
@@ -655,7 +707,8 @@ async function getProductById(
 
 async function updateProductsStock(
   items: OrderItem[],
-  logger: any
+  logger: any,
+  stockUpdatedItems?: OrderItem[]
 ): Promise<void> {
   const stockUpdateTracker = new PerformanceTracker(
     logger,
@@ -663,26 +716,28 @@ async function updateProductsStock(
   );
 
   try {
-    const itemsWithStockControl = items.filter(item => 
-      item.hasStockControl && item.quantity > 0
+    const itemsWithStockControl = items.filter(
+      (item) => item.hasStockControl && item.quantity > 0
     );
 
     logger.info("Starting products stock update", {
       totalItemsCount: items.length,
       itemsWithStockControlCount: itemsWithStockControl.length,
-      itemsWithStockControl: itemsWithStockControl.map(item => ({
+      itemsWithStockControl: itemsWithStockControl.map((item) => ({
         productId: item.id,
         quantity: item.quantity,
-        productName: item.productName
-      }))
+        productName: item.productName,
+      })),
     });
 
     if (itemsWithStockControl.length === 0) {
-      logger.info("No products with stock control found, skipping stock update");
+      logger.info(
+        "No products with stock control found, skipping stock update"
+      );
       stockUpdateTracker.finish({
         updatedProducts: 0,
         totalQuantitySubtracted: 0,
-        skippedReason: "no_stock_control"
+        skippedReason: "no_stock_control",
       });
       return;
     }
@@ -692,44 +747,52 @@ async function updateProductsStock(
         logger.info("Updating stock for product", {
           productId: item.id,
           productName: item.productName,
-          quantityToSubtract: item.quantity
+          quantityToSubtract: item.quantity,
         });
 
         const updateCommand = new UpdateCommand({
           TableName: PRODUCT_TABLE_NAME,
           Key: {
-            productId: item.id
+            productId: item.id,
           },
-          UpdateExpression: "SET quantityInStock = quantityInStock - :quantity, updatedAt = :updatedAt",
-          ConditionExpression: "quantityInStock >= :quantity AND isActive = :isActive",
+          UpdateExpression:
+            "SET quantityInStock = quantityInStock - :quantity, updatedAt = :updatedAt",
+          ConditionExpression:
+            "quantityInStock >= :quantity AND isActive = :isActive",
           ExpressionAttributeValues: {
             ":quantity": item.quantity,
             ":isActive": true,
-            ":updatedAt": new Date().toISOString()
+            ":updatedAt": new Date().toISOString(),
           },
-          ReturnValues: "ALL_NEW"
+          ReturnValues: "ALL_NEW",
         });
 
         const result = await docClient.send(updateCommand);
 
+        if (stockUpdatedItems) {
+          stockUpdatedItems.push(item);
+        }
+
         logger.info("Stock updated successfully", {
           productId: item.id,
           productName: item.productName,
-          previousStock: (result.Attributes?.quantityInStock as number) + item.quantity,
+          previousStock:
+            (result.Attributes?.quantityInStock as number) + item.quantity,
           newStock: result.Attributes?.quantityInStock as number,
-          quantitySubtracted: item.quantity
+          quantitySubtracted: item.quantity,
         });
-
       } catch (error: any) {
         logger.error("Failed to update stock for product", error, {
           productId: item.id,
           productName: item.productName,
           quantityToSubtract: item.quantity,
-          errorCode: error.name
+          errorCode: error.name,
         });
 
-        if (error.name === 'ConditionalCheckFailedException') {
-          throw new Error(`Stock update failed for product ${item.productName}. Insufficient stock or product is inactive.`);
+        if (error.name === "ConditionalCheckFailedException") {
+          throw new Error(
+            `Stock update failed for product ${item.productName}. Insufficient stock or product is inactive.`
+          );
         }
 
         throw error;
@@ -740,27 +803,122 @@ async function updateProductsStock(
 
     stockUpdateTracker.finish({
       updatedProducts: itemsWithStockControl.length,
-      totalQuantitySubtracted: itemsWithStockControl.reduce((total, item) => total + item.quantity, 0)
+      totalQuantitySubtracted: itemsWithStockControl.reduce(
+        (total, item) => total + item.quantity,
+        0
+      ),
     });
 
     logger.info("All products stock updated successfully", {
       totalItemsCount: items.length,
       updatedProductsCount: itemsWithStockControl.length,
-      totalQuantitySubtracted: itemsWithStockControl.reduce((total, item) => total + item.quantity, 0)
+      totalQuantitySubtracted: itemsWithStockControl.reduce(
+        (total, item) => total + item.quantity,
+        0
+      ),
     });
-
   } catch (error) {
     logger.error("Error updating products stock", error, {
       itemsCount: items.length,
-      items: items.map(item => ({
+      items: items.map((item) => ({
         productId: item.id,
         quantity: item.quantity,
-        productName: item.productName
-      }))
+        productName: item.productName,
+      })),
     });
 
     stockUpdateTracker.finishWithError(error);
 
     throw error;
+  }
+}
+
+async function sendStockRollbackMessages(
+  stockUpdatedItems: OrderItem[],
+  orderId: string,
+  logger: any
+): Promise<void> {
+  const rollbackTracker = new PerformanceTracker(
+    logger,
+    "stock-rollback-messages"
+  );
+
+  try {
+    logger.info("Sending stock rollback messages", {
+      itemsCount: stockUpdatedItems.length,
+      orderId: orderId,
+      items: stockUpdatedItems.map((item) => ({
+        productId: item.id,
+        quantity: item.quantity,
+        productName: item.productName,
+      })),
+    });
+
+    const sendPromises = stockUpdatedItems.map(async (item) => {
+      const stockMessage: StockUpdateMessage = {
+        productId: item.id,
+        quantity: item.quantity,
+        operation: StockOperationType.INCREASE,
+        orderId: orderId,
+        reason: "Order creation failed - rolling back stock reduction",
+      };
+
+      try {
+        const sendCommand = new SendMessageCommand({
+          QueueUrl: PRODUCT_STOCK_QUEUE_URL,
+          MessageBody: JSON.stringify(stockMessage),
+          MessageAttributes: {
+            operation: {
+              DataType: "String",
+              StringValue: stockMessage.operation,
+            },
+            productId: {
+              DataType: "String",
+              StringValue: stockMessage.productId,
+            },
+            orderId: {
+              DataType: "String",
+              StringValue: orderId,
+            },
+          },
+        });
+
+        await sqsClient.send(sendCommand);
+
+        logger.info("Stock rollback message sent successfully", {
+          productId: item.id,
+          productName: item.productName,
+          quantity: item.quantity,
+          operation: stockMessage.operation,
+          orderId: orderId,
+        });
+      } catch (error) {
+        logger.error("Failed to send stock rollback message", error, {
+          productId: item.id,
+          productName: item.productName,
+          quantity: item.quantity,
+          orderId: orderId,
+        });
+      }
+    });
+
+    await Promise.all(sendPromises);
+
+    rollbackTracker.finish({
+      rollbackMessagesCount: stockUpdatedItems.length,
+      orderId: orderId,
+    });
+
+    logger.info("All stock rollback messages sent", {
+      totalMessages: stockUpdatedItems.length,
+      orderId: orderId,
+    });
+  } catch (error) {
+    logger.error("Error sending stock rollback messages", error, {
+      itemsCount: stockUpdatedItems.length,
+      orderId: orderId,
+    });
+
+    rollbackTracker.finishWithError(error);
   }
 }

@@ -10,6 +10,7 @@ provider:
   environment:
     INITIALIZE_ORDER_TOPIC_ARN: !Ref InitializeOrderTopic
     CREATE_LEAD_QUEUE_URL: !Ref CreateLeadQueue
+    PRODUCT_STOCK_QUEUE_URL: !Ref ProductStockQueue
     LEAD_COLLECTION_TABLE: !Ref LeadCollectionTable
     ORDER_COLLECTION_TABLE: !Ref OrderCollectionTable
     PRODUCT_COLLECTION_TABLE: !Ref ProductCollectionTable
@@ -58,6 +59,10 @@ functions:
           - !GetAtt ProductCollectionTable.Arn
           - !Sub "${LeadCollectionTable.Arn}/index/*"
           - !Sub "${OrderCollectionTable.Arn}/index/*"
+      - Effect: Allow
+        Action:
+          - sqs:SendMessage
+        Resource: !GetAtt ProductStockQueue.Arn
 
   createLead:
     handler: lambdas/lead/create-lead.handler
@@ -78,6 +83,27 @@ functions:
           - dynamodb:Query
           - dynamodb:PutItem
         Resource: !GetAtt LeadCollectionTable.Arn
+
+  updateProductStock:
+    handler: lambdas/product/update-product-stock.handler
+    description: Function responsible for updating product stock
+    events:
+      - sqs:
+          arn: !GetAtt ProductStockQueue.Arn
+          batchSize: 10
+          maximumBatchingWindowInSeconds: 5
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - sqs:ReceiveMessage
+          - sqs:DeleteMessage
+          - sqs:GetQueueAttributes
+        Resource: !GetAtt ProductStockQueue.Arn
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+        Resource: !GetAtt ProductCollectionTable.Arn
 
 resources:
   Resources:
@@ -283,6 +309,32 @@ resources:
             Value: ${self:service}-create-lead-dlq
           - Key: Description
             Value: Dead letter queue for failed lead creation messages
+
+    # SQS Queue for Product Stock Updates
+    ProductStockQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: product-stock-queue
+        VisibilityTimeoutSeconds: 300
+        MessageRetentionPeriod: 1209600 # 14 days
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ProductStockDeadLetterQueue.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Name
+            Value: ${self:service}-product-stock-queue
+          - Key: Description
+            Value: Queue responsible for processing product stock updates
+
+    # Dead Letter Queue for Product Stock Queue
+    ProductStockDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: product-stock-dlq
+        MessageRetentionPeriod: 1209600 # 14 days
+        Tags:
+          - Key: Name
+            Value: ${self:service}-product-stock-dlq
 
     # SQS Queue Policy to allow SNS to send messages
     CreateLeadQueuePolicy:
