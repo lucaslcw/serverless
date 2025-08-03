@@ -1,0 +1,528 @@
+service: serverless
+
+plugins:
+  - serverless-iam-roles-per-function
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  environment:
+    INITIALIZE_ORDER_TOPIC_ARN: !Ref InitializeOrderTopic
+    CREATE_LEAD_QUEUE_URL: !Ref CreateLeadQueue
+    LEAD_COLLECTION_TABLE: !Ref LeadCollectionTable
+    ORDER_COLLECTION_TABLE: !Ref OrderCollectionTable
+    PRODUCT_COLLECTION_TABLE: !Ref ProductCollectionTable
+  vpc:
+    securityGroupIds:
+      - !Ref LambdaSecurityGroup
+    subnetIds:
+      - !Ref PrivateSubnetA
+      - !Ref PrivateSubnetB
+
+functions:
+  createOrderRequest:
+    handler: lambdas/order/initialize-order.handler
+    events:
+      - httpApi:
+          path: /orders
+          method: post
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - sns:Publish
+        Resource: !Ref InitializeOrderTopic
+
+  createOrder:
+    handler: lambdas/order/create-order.handler
+    description: Function responsible for order creation
+    events:
+      - sqs:
+          arn: !GetAtt CreateOrderQueue.Arn
+          batchSize: 10
+          maximumBatchingWindowInSeconds: 5
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - sqs:ReceiveMessage
+          - sqs:DeleteMessage
+          - sqs:GetQueueAttributes
+        Resource: !GetAtt CreateOrderQueue.Arn
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+          - dynamodb:PutItem
+        Resource: 
+          - !GetAtt LeadCollectionTable.Arn
+          - !GetAtt OrderCollectionTable.Arn
+          - !GetAtt ProductCollectionTable.Arn
+          - !Sub "${LeadCollectionTable.Arn}/index/*"
+          - !Sub "${OrderCollectionTable.Arn}/index/*"
+
+  createLead:
+    handler: lambdas/lead/create-lead.handler
+    events:
+      - sqs:
+          arn: !GetAtt CreateLeadQueue.Arn
+          batchSize: 10
+          maximumBatchingWindowInSeconds: 5
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - sqs:ReceiveMessage
+          - sqs:DeleteMessage
+          - sqs:GetQueueAttributes
+        Resource: !GetAtt CreateLeadQueue.Arn
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+          - dynamodb:PutItem
+        Resource: !GetAtt LeadCollectionTable.Arn
+
+resources:
+  Resources:
+    # VPC Configuration
+    VPC:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.0.0.0/16
+        EnableDnsHostnames: true
+        EnableDnsSupport: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-vpc
+
+    # Private Subnets for Lambda Functions
+    PrivateSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref VPC
+        AvailabilityZone: ${self:provider.region}a
+        CidrBlock: 10.0.10.0/24
+        Tags:
+          - Key: Name
+            Value: ${self:service}-private-subnet-a
+
+    PrivateSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref VPC
+        AvailabilityZone: ${self:provider.region}b
+        CidrBlock: 10.0.20.0/24
+        Tags:
+          - Key: Name
+            Value: ${self:service}-private-subnet-b
+
+    # Security Group for Lambda Functions
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupName: ${self:service}-lambda-sg
+        GroupDescription: Security group for Lambda functions
+        VpcId: !Ref VPC
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+        Tags:
+          - Key: Name
+            Value: ${self:service}-lambda-sg
+
+    # VPC Endpoint Security Group
+    VPCEndpointSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupName: ${self:service}-vpc-endpoint-sg
+        GroupDescription: Security group for VPC endpoints
+        VpcId: !Ref VPC
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            SourceSecurityGroupId: !Ref LambdaSecurityGroup
+        Tags:
+          - Key: Name
+            Value: ${self:service}-sqs-vpc-endpoint
+
+    # DynamoDB VPC Endpoint
+    DynamoDBVPCEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: !Ref VPC
+        ServiceName: com.amazonaws.${self:provider.region}.dynamodb
+        RouteTableIds: []
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action:
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:Scan
+              Resource: '*'
+        VpcEndpointType: Gateway
+        Tags:
+          - Key: Name
+            Value: ${self:service}-dynamodb-vpc-endpoint-sg
+
+    # VPC Endpoint for SNS
+    SNSVPCEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: !Ref VPC
+        ServiceName: !Sub 'com.amazonaws.${self:provider.region}.sns'
+        VpcEndpointType: Interface
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref VPCEndpointSecurityGroup
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action:
+                - sns:Publish
+                - sns:Subscribe
+                - sns:Unsubscribe
+                - sns:CreateTopic
+                - sns:DeleteTopic
+                - sns:ListTopics
+                - sns:GetTopicAttributes
+                - sns:SetTopicAttributes
+              Resource: '*'
+        PrivateDnsEnabled: true
+
+    # VPC Endpoint for SQS
+    SQSVPCEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: !Ref VPC
+        ServiceName: !Sub 'com.amazonaws.${self:provider.region}.sqs'
+        VpcEndpointType: Interface
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref VPCEndpointSecurityGroup
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action:
+                - sqs:SendMessage
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:GetQueueUrl
+                - sqs:ListQueues
+              Resource: '*'
+        PrivateDnsEnabled: true
+
+    # SNS Topic for Initialize Order
+    InitializeOrderTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: initialize-order-topic
+        DisplayName: Initialize Order Topic
+        Description: Topic that will receive the order initialization message
+
+    # SQS Queue for Order Creation
+    CreateOrderQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: create-order-queue
+        VisibilityTimeoutSeconds: 300
+        MessageRetentionPeriod: 1209600 # 14 days
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt CreateOrderDeadLetterQueue.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Name
+            Value: ${self:service}-create-order-queue
+          - Key: Description
+            Value: Queue responsible for receiving order creation messages
+
+    # Dead Letter Queue for Create Order Queue
+    CreateOrderDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: create-order-dlq
+        MessageRetentionPeriod: 1209600 # 14 days
+        Tags:
+          - Key: Name
+            Value: ${self:service}-create-order-dlq
+
+    # SQS Queue for Lead Creation
+    CreateLeadQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: create-lead-queue
+        VisibilityTimeoutSeconds: 300
+        MessageRetentionPeriod: 1209600 # 14 days
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt CreateLeadDeadLetterQueue.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Name
+            Value: ${self:service}-create-lead-queue
+          - Key: Description
+            Value: Queue that will receive messages to process lead creation
+
+    # Dead Letter Queue for Create Lead Queue
+    CreateLeadDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: create-lead-dlq
+        MessageRetentionPeriod: 1209600 # 14 days
+        Tags:
+          - Key: Name
+            Value: ${self:service}-create-lead-dlq
+          - Key: Description
+            Value: Dead letter queue for failed lead creation messages
+
+    # SQS Queue Policy to allow SNS to send messages
+    CreateLeadQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: AllowSNSToSendMessages
+              Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt CreateLeadQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref InitializeOrderTopic
+        Queues:
+          - !GetAtt CreateLeadQueue
+          - !GetAtt CreateOrderQueue
+
+    # SNS Subscription to SQS for Lead Creation
+    InitializeOrderToCreateLeadSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref InitializeOrderTopic
+        Protocol: sqs
+        Endpoint: !GetAtt CreateLeadQueue.Arn
+        RawMessageDelivery: false
+        FilterPolicy:
+          messageType:
+            - "order_created"
+
+    # SNS Subscription to SQS for Order Creation
+    InitializeOrderToCreateOrderSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref InitializeOrderTopic
+        Protocol: sqs
+        Endpoint: !GetAtt CreateOrderQueue.Arn
+        RawMessageDelivery: false
+        FilterPolicy:
+          messageType:
+            - "order_created"
+
+    # DynamoDB Table for Lead Collection
+    LeadCollectionTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: lead-collection
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: customerEmail
+            AttributeType: S
+          - AttributeName: customerCpf
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: email-index
+            KeySchema:
+              - AttributeName: customerEmail
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+          - IndexName: cpf-index
+            KeySchema:
+              - AttributeName: customerCpf
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Name
+            Value: ${self:service}-lead-collection
+          - Key: Description
+            Value: Table to store lead information with email and CPF validation
+
+    # DynamoDB Table for Order Collection
+    OrderCollectionTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: order-collection
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: orderId
+            AttributeType: S
+          - AttributeName: customerEmail
+            AttributeType: S
+          - AttributeName: customerCpf
+            AttributeType: S
+          - AttributeName: leadId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: orderId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: email-index
+            KeySchema:
+              - AttributeName: customerEmail
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+          - IndexName: cpf-index
+            KeySchema:
+              - AttributeName: customerCpf
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+          - IndexName: lead-index
+            KeySchema:
+              - AttributeName: leadId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Name
+            Value: ${self:service}-order-collection
+          - Key: Description
+            Value: Table to store order information with lead association
+
+    # DynamoDB Table for Product Collection
+    ProductCollectionTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: product-collection
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: productId
+            AttributeType: S
+          - AttributeName: name
+            AttributeType: S
+          - AttributeName: category
+            AttributeType: S
+        KeySchema:
+          - AttributeName: productId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: name-index
+            KeySchema:
+              - AttributeName: name
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+          - IndexName: category-index
+            KeySchema:
+              - AttributeName: category
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Name
+            Value: ${self:service}-product-collection
+          - Key: Description
+            Value: Table to store product information with pricing and details
+        
+  Outputs:
+    InitializeOrderTopicArn:
+      Description: Initialize Order Topic ARN
+      Value: !Ref InitializeOrderTopic
+      Export:
+        Name: ${self:service}-${self:provider.stage}-initialize-order-topic-arn
+
+    CreateLeadQueueUrl:
+      Description: URL of the Create Lead SQS Queue
+      Value: !Ref CreateLeadQueue
+      Export:
+        Name: ${self:service}-${self:provider.stage}-create-lead-queue-url
+
+    CreateLeadQueueArn:
+      Description: ARN of the Create Lead SQS Queue
+      Value: !GetAtt CreateLeadQueue.Arn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-create-lead-queue-arn
+
+    CreateLeadDeadLetterQueueUrl:
+      Description: URL of the Create Lead Dead Letter Queue
+      Value: !Ref CreateLeadDeadLetterQueue
+      Export:
+        Name: ${self:service}-${self:provider.stage}-create-lead-dlq-url
+
+    LeadCollectionTableName:
+      Description: Name of the Lead Collection DynamoDB Table
+      Value: !Ref LeadCollectionTable
+      Export:
+        Name: ${self:service}-${self:provider.stage}-lead-collection-table-name
+
+    LeadCollectionTableArn:
+      Description: ARN of the Lead Collection DynamoDB Table
+      Value: !GetAtt LeadCollectionTable.Arn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-lead-collection-table-arn
+
+    OrderCollectionTableName:
+      Description: Name of the Order Collection DynamoDB Table
+      Value: !Ref OrderCollectionTable
+      Export:
+        Name: ${self:service}-${self:provider.stage}-order-collection-table-name
+
+    OrderCollectionTableArn:
+      Description: ARN of the Order Collection DynamoDB Table
+      Value: !GetAtt OrderCollectionTable.Arn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-order-collection-table-arn
+
+    ProductCollectionTableName:
+      Description: Name of the Product Collection DynamoDB Table
+      Value: !Ref ProductCollectionTable
+      Export:
+        Name: ${self:service}-${self:provider.stage}-product-collection-table-name
+
+    ProductCollectionTableArn:
+      Description: ARN of the Product Collection DynamoDB Table
+      Value: !GetAtt ProductCollectionTable.Arn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-product-collection-table-arn
+    
+    VPCId:
+      Description: VPC ID
+      Value: !Ref VPC
+      Export:
+        Name: ${self:service}-${self:provider.stage}-vpc-id
+    
+    PrivateSubnetAId:
+      Description: Private Subnet A ID
+      Value: !Ref PrivateSubnetA
+      Export:
+        Name: ${self:service}-${self:provider.stage}-private-subnet-a-id
+    
+    PrivateSubnetBId:
+      Description: Private Subnet B ID
+      Value: !Ref PrivateSubnetB
+      Export:
+        Name: ${self:service}-${self:provider.stage}-private-subnet-b-id
+    
+    LambdaSecurityGroupId:
+      Description: Lambda Security Group ID
+      Value: !Ref LambdaSecurityGroup
+      Export:
+        Name: ${self:service}-${self:provider.stage}-lambda-sg-id
