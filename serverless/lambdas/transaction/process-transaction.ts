@@ -6,6 +6,7 @@ import {
   UpdateCommand,
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import {
   createLogger,
   generateCorrelationId,
@@ -15,9 +16,11 @@ import {
 
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
 
 const ORDER_TABLE_NAME = process.env.ORDER_COLLECTION_TABLE!;
 const TRANSACTION_TABLE_NAME = process.env.TRANSACTION_COLLECTION_TABLE!;
+const UPDATE_ORDER_QUEUE_URL = process.env.UPDATE_ORDER_QUEUE_URL!;
 
 enum PaymentStatus {
   PENDING = "PENDING",
@@ -242,9 +245,15 @@ async function processTransaction(
       logger
     );
 
-    await updateOrderStatus(
+    const finalStatus = paymentResult.status === PaymentStatus.APPROVED 
+      ? "PROCESSED" 
+      : "CANCELLED";
+    
+    await sendUpdateOrderMessage(
       message.orderId,
-      paymentResult.status === PaymentStatus.APPROVED ? OrderStatus.PAYMENT_APPROVED : OrderStatus.PAYMENT_DECLINED,
+      finalStatus,
+      `Payment ${paymentResult.status.toLowerCase()}: ${paymentResult.authCode || 'No auth code'}`,
+      transactionId,
       logger
     );
 
@@ -289,7 +298,13 @@ async function processTransaction(
         logger
       );
       
-      await updateOrderStatus(message.orderId, OrderStatus.PENDING, logger);
+      await sendUpdateOrderMessage(
+        message.orderId,
+        "CANCELLED",
+        `Payment processing error: ${error.message}`,
+        transactionId,
+        logger
+      );
     } catch (updateError) {
       logger.error("Failed to create error transaction record", updateError, {
         orderId: message.orderId,
@@ -586,6 +601,80 @@ async function updateOrderStatus(
     });
 
     updateTracker.finishWithError(error);
+    throw error;
+  }
+}
+
+async function sendUpdateOrderMessage(
+  orderId: string,
+  status: string,
+  reason: string,
+  transactionId: string,
+  logger: any
+): Promise<void> {
+  const messageTracker = new PerformanceTracker(
+    logger,
+    "update-order-message-send"
+  );
+
+  try {
+    logger.info("Sending update order message", {
+      orderId: orderId,
+      status: status,
+      reason: reason,
+      transactionId: transactionId,
+    });
+
+    const updateOrderMessage = {
+      orderId: orderId,
+      status: status,
+      reason: reason,
+      transactionId: transactionId
+    };
+
+    const sendCommand = new SendMessageCommand({
+      QueueUrl: UPDATE_ORDER_QUEUE_URL,
+      MessageBody: JSON.stringify(updateOrderMessage),
+      MessageAttributes: {
+        orderId: {
+          DataType: "String",
+          StringValue: orderId,
+        },
+        status: {
+          DataType: "String",
+          StringValue: status,
+        },
+        transactionId: {
+          DataType: "String",
+          StringValue: transactionId,
+        }
+      },
+    });
+
+    const result = await sqsClient.send(sendCommand);
+
+    messageTracker.finish({
+      orderId: orderId,
+      status: status,
+      messageId: result.MessageId,
+    });
+
+    logger.info("Update order message sent successfully", {
+      orderId: orderId,
+      status: status,
+      reason: reason,
+      transactionId: transactionId,
+      messageId: result.MessageId,
+    });
+
+  } catch (error: any) {
+    logger.error("Failed to send update order message", error, {
+      orderId: orderId,
+      status: status,
+      errorName: error.name,
+    });
+
+    messageTracker.finishWithError(error);
     throw error;
   }
 }

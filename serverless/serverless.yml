@@ -12,6 +12,7 @@ provider:
     CREATE_LEAD_QUEUE_URL: !Ref CreateLeadQueue
     PRODUCT_STOCK_QUEUE_URL: !Ref ProductStockQueue
     PROCESS_TRANSACTION_QUEUE_URL: !Ref ProcessTransactionQueue
+    UPDATE_ORDER_QUEUE_URL: !Ref UpdateOrderQueue
     LEAD_COLLECTION_TABLE: !Ref LeadCollectionTable
     ORDER_COLLECTION_TABLE: !Ref OrderCollectionTable
     PRODUCT_COLLECTION_TABLE: !Ref ProductCollectionTable
@@ -137,6 +138,31 @@ functions:
           - dynamodb:GetItem
           - dynamodb:UpdateItem
         Resource: !GetAtt TransactionCollectionTable.Arn
+      - Effect: Allow
+        Action:
+          - sqs:SendMessage
+        Resource: !GetAtt UpdateOrderQueue.Arn
+
+  updateOrder:
+    handler: lambdas/order/update-order.handler
+    description: Function responsible for updating order status after payment processing
+    events:
+      - sqs:
+          arn: !GetAtt UpdateOrderQueue.Arn
+          batchSize: 10
+          maximumBatchingWindowInSeconds: 5
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - sqs:ReceiveMessage
+          - sqs:DeleteMessage
+          - sqs:GetQueueAttributes
+        Resource: !GetAtt UpdateOrderQueue.Arn
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+        Resource: !GetAtt OrderCollectionTable.Arn
 
 resources:
   Resources:
@@ -394,6 +420,32 @@ resources:
         Tags:
           - Key: Name
             Value: ${self:service}-process-transaction-dlq
+
+    # SQS Queue for Update Order
+    UpdateOrderQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: update-order-queue
+        VisibilityTimeoutSeconds: 300
+        MessageRetentionPeriod: 1209600 # 14 days
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt UpdateOrderDeadLetterQueue.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Name
+            Value: ${self:service}-update-order-queue
+          - Key: Description
+            Value: Queue responsible for updating order status after payment processing
+
+    # Dead Letter Queue for Update Order Queue
+    UpdateOrderDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: update-order-dlq
+        MessageRetentionPeriod: 1209600 # 14 days
+        Tags:
+          - Key: Name
+            Value: ${self:service}-update-order-dlq
 
     # SQS Queue Policy to allow SNS to send messages
     CreateLeadQueuePolicy:
