@@ -11,9 +11,11 @@ provider:
     INITIALIZE_ORDER_TOPIC_ARN: !Ref InitializeOrderTopic
     CREATE_LEAD_QUEUE_URL: !Ref CreateLeadQueue
     PRODUCT_STOCK_QUEUE_URL: !Ref ProductStockQueue
+    PROCESS_TRANSACTION_QUEUE_URL: !Ref ProcessTransactionQueue
     LEAD_COLLECTION_TABLE: !Ref LeadCollectionTable
     ORDER_COLLECTION_TABLE: !Ref OrderCollectionTable
     PRODUCT_COLLECTION_TABLE: !Ref ProductCollectionTable
+    TRANSACTION_COLLECTION_TABLE: !Ref TransactionCollectionTable
   vpc:
     securityGroupIds:
       - !Ref LambdaSecurityGroup
@@ -63,6 +65,10 @@ functions:
         Action:
           - sqs:SendMessage
         Resource: !GetAtt ProductStockQueue.Arn
+      - Effect: Allow
+        Action:
+          - sqs:SendMessage
+        Resource: !GetAtt ProcessTransactionQueue.Arn
 
   createLead:
     handler: lambdas/lead/create-lead.handler
@@ -104,6 +110,33 @@ functions:
           - dynamodb:GetItem
           - dynamodb:UpdateItem
         Resource: !GetAtt ProductCollectionTable.Arn
+
+  processTransaction:
+    handler: lambdas/transaction/process-transaction.handler
+    description: Function responsible for processing payment transactions
+    events:
+      - sqs:
+          arn: !GetAtt ProcessTransactionQueue.Arn
+          batchSize: 10
+          maximumBatchingWindowInSeconds: 5
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - sqs:ReceiveMessage
+          - sqs:DeleteMessage
+          - sqs:GetQueueAttributes
+        Resource: !GetAtt ProcessTransactionQueue.Arn
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+        Resource: !GetAtt OrderCollectionTable.Arn
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+        Resource: !GetAtt TransactionCollectionTable.Arn
 
 resources:
   Resources:
@@ -336,6 +369,32 @@ resources:
           - Key: Name
             Value: ${self:service}-product-stock-dlq
 
+    # SQS Queue for Transaction Processing
+    ProcessTransactionQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: process-transaction-queue
+        VisibilityTimeoutSeconds: 300
+        MessageRetentionPeriod: 1209600 # 14 days
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ProcessTransactionDeadLetterQueue.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Name
+            Value: ${self:service}-process-transaction-queue
+          - Key: Description
+            Value: Queue responsible for processing payment transactions
+
+    # Dead Letter Queue for Process Transaction Queue
+    ProcessTransactionDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: process-transaction-dlq
+        MessageRetentionPeriod: 1209600 # 14 days
+        Tags:
+          - Key: Name
+            Value: ${self:service}-process-transaction-dlq
+
     # SQS Queue Policy to allow SNS to send messages
     CreateLeadQueuePolicy:
       Type: AWS::SQS::QueuePolicy
@@ -493,6 +552,41 @@ resources:
             Value: ${self:service}-product-collection
           - Key: Description
             Value: Table to store product information with pricing and details
+
+    # DynamoDB Table for Transaction Collection
+    TransactionCollectionTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: transaction-collection
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: transactionId
+            AttributeType: S
+          - AttributeName: orderId
+            AttributeType: S
+          - AttributeName: paymentStatus
+            AttributeType: S
+        KeySchema:
+          - AttributeName: transactionId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: order-index
+            KeySchema:
+              - AttributeName: orderId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+          - IndexName: payment-status-index
+            KeySchema:
+              - AttributeName: paymentStatus
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Name
+            Value: ${self:service}-transaction-collection
+          - Key: Description
+            Value: Table to store transaction information with payment data separation
         
   Outputs:
     InitializeOrderTopicArn:

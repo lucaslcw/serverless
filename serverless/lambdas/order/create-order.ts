@@ -23,6 +23,7 @@ const LEAD_TABLE_NAME = process.env.LEAD_COLLECTION_TABLE!;
 const ORDER_TABLE_NAME = process.env.ORDER_COLLECTION_TABLE!;
 const PRODUCT_TABLE_NAME = process.env.PRODUCT_COLLECTION_TABLE!;
 const PRODUCT_STOCK_QUEUE_URL = process.env.PRODUCT_STOCK_QUEUE_URL!;
+const PROCESS_TRANSACTION_QUEUE_URL = process.env.PROCESS_TRANSACTION_QUEUE_URL!;
 
 enum OrderStatus {
   PENDING = "PENDING",
@@ -40,6 +41,17 @@ interface StockUpdateMessage {
   operation: StockOperationType;
   orderId?: string;
   reason?: string;
+}
+
+interface TransactionMessage {
+  orderId: string;
+  paymentData: any;
+  addressData: any;
+  customerInfo: {
+    name: string;
+    email: string;
+    cpf: string;
+  };
 }
 
 interface OrderItem {
@@ -67,6 +79,8 @@ interface OrderData {
   email: string;
   name: string;
   items: OrderItem[];
+  paymentData?: any;
+  addressData?: any;
   timestamp: string;
   status: string;
 }
@@ -195,6 +209,20 @@ export const handler = async (event: SQSEvent): Promise<void> => {
         };
 
         await createOrderInDatabase(orderRecord, orderLogger);
+
+        if (message.paymentData && message.addressData) {
+          await sendTransactionMessage(
+            message.orderId,
+            message.paymentData,
+            message.addressData,
+            {
+              name: message.name,
+              email: message.email,
+              cpf: message.cpf,
+            },
+            orderLogger
+          );
+        }
 
         processingTracker.finish({
           newStatus: orderRecord.status,
@@ -920,5 +948,79 @@ async function sendStockRollbackMessages(
     });
 
     rollbackTracker.finishWithError(error);
+  }
+}
+
+async function sendTransactionMessage(
+  orderId: string,
+  paymentData: any,
+  addressData: any,
+  customerInfo: { name: string; email: string; cpf: string },
+  logger: any
+): Promise<void> {
+  const transactionTracker = new PerformanceTracker(
+    logger,
+    "transaction-message-send"
+  );
+
+  try {
+    logger.info("Sending transaction processing message", {
+      orderId: orderId,
+      amount: paymentData.amount,
+      cardLastFour: paymentData.cardNumber?.slice(-4),
+      customerName: maskSensitiveData.name(customerInfo.name),
+      addressCity: addressData.city,
+      addressState: addressData.state,
+    });
+
+    const transactionMessage: TransactionMessage = {
+      orderId: orderId,
+      paymentData: paymentData,
+      addressData: addressData,
+      customerInfo: customerInfo,
+    };
+
+    const sendCommand = new SendMessageCommand({
+      QueueUrl: PROCESS_TRANSACTION_QUEUE_URL,
+      MessageBody: JSON.stringify(transactionMessage),
+      MessageAttributes: {
+        orderId: {
+          DataType: "String",
+          StringValue: orderId,
+        },
+        amount: {
+          DataType: "Number",
+          StringValue: paymentData.amount.toString(),
+        },
+        customerEmail: {
+          DataType: "String",
+          StringValue: customerInfo.email,
+        },
+      },
+    });
+
+    await sqsClient.send(sendCommand);
+
+    transactionTracker.finish({
+      orderId: orderId,
+      amount: paymentData.amount,
+      queueUrl: PROCESS_TRANSACTION_QUEUE_URL,
+    });
+
+    logger.info("Transaction processing message sent successfully", {
+      orderId: orderId,
+      amount: paymentData.amount,
+      cardLastFour: paymentData.cardNumber?.slice(-4),
+      customerName: maskSensitiveData.name(customerInfo.name),
+    });
+
+  } catch (error) {
+    logger.error("Failed to send transaction processing message", error, {
+      orderId: orderId,
+      amount: paymentData.amount,
+      customerName: maskSensitiveData.name(customerInfo.name),
+    });
+
+    transactionTracker.finishWithError(error);
   }
 }

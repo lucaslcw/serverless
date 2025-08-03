@@ -60,6 +60,8 @@ export const handler = async (
       email: orderData.email,
       name: orderData.name,
       items: orderData.items,
+      paymentData: orderData.paymentData,
+      addressData: orderData.addressData,
       timestamp: new Date().toISOString(),
       status: "requested",
     };

@@ -121,7 +121,25 @@ describe('Validators', () => {
         cpf: '123.456.789-01',
         email: 'test@example.com',
         name: 'João Silva',
-        items: [{ id: 'item1', quantity: 2 }]
+        items: [{ id: 'item1', quantity: 2 }],
+        paymentData: {
+          cardNumber: '1234567890123456',
+          cardHolderName: 'JOAO SILVA',
+          expiryMonth: '12',
+          expiryYear: '2026',
+          cvv: '123',
+          amount: 100.00
+        },
+        addressData: {
+          street: 'Rua das Flores',
+          number: '123',
+          complement: 'Apto 101',
+          neighborhood: 'Centro',
+          city: 'São Paulo',
+          state: 'SP',
+          zipCode: '01234-567',
+          country: 'BRASIL'
+        }
       };
       const result = validateCreateOrderData(data);
       expect(result.isValid).toBe(true);
