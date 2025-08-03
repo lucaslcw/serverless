@@ -192,6 +192,8 @@ export const handler = async (event: SQSEvent): Promise<void> => {
         sqsMessagePreview: record.body.substring(0, 200),
       });
 
+      // TODO: Enviar para a fila de estoque para retornar os produtos que foram baixados
+
       recordTracker.finishWithError(error);
 
       throw error;
