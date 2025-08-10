@@ -501,9 +501,11 @@ resources:
         AttributeDefinitions:
           - AttributeName: id
             AttributeType: S
-          - AttributeName: customerEmail
+          - AttributeName: email
             AttributeType: S
-          - AttributeName: customerCpf
+          - AttributeName: cpf
+            AttributeType: S
+          - AttributeName: name
             AttributeType: S
         KeySchema:
           - AttributeName: id
@@ -511,13 +513,13 @@ resources:
         GlobalSecondaryIndexes:
           - IndexName: email-index
             KeySchema:
-              - AttributeName: customerEmail
+              - AttributeName: email
                 KeyType: HASH
             Projection:
               ProjectionType: ALL
           - IndexName: cpf-index
             KeySchema:
-              - AttributeName: customerCpf
+              - AttributeName: cpf
                 KeyType: HASH
             Projection:
               ProjectionType: ALL
@@ -534,27 +536,27 @@ resources:
         TableName: order-collection
         BillingMode: PAY_PER_REQUEST
         AttributeDefinitions:
-          - AttributeName: orderId
+          - AttributeName: id
             AttributeType: S
-          - AttributeName: customerEmail
+          - AttributeName: email
             AttributeType: S
-          - AttributeName: customerCpf
+          - AttributeName: cpf
             AttributeType: S
           - AttributeName: leadId
             AttributeType: S
         KeySchema:
-          - AttributeName: orderId
+          - AttributeName: id
             KeyType: HASH
         GlobalSecondaryIndexes:
           - IndexName: email-index
             KeySchema:
-              - AttributeName: customerEmail
+              - AttributeName: email
                 KeyType: HASH
             Projection:
               ProjectionType: ALL
           - IndexName: cpf-index
             KeySchema:
-              - AttributeName: customerCpf
+              - AttributeName: cpf
                 KeyType: HASH
             Projection:
               ProjectionType: ALL

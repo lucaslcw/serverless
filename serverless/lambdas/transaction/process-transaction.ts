@@ -3,7 +3,6 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
   GetCommand,
-  UpdateCommand,
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
@@ -12,93 +11,91 @@ import {
   generateCorrelationId,
   maskSensitiveData,
   PerformanceTracker,
+  StructuredLogger,
 } from "../../shared/logger";
+import {
+  AddressData,
+  CustomerData,
+  OrderData,
+  OrderStatus,
+  PaymentData,
+} from "../../shared/schemas/order";
+import { PaymentStatus, TransactionData } from "../../shared/schemas/transaction";
 
-const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'us-east-1' });
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
-const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
+const sqsClient = new SQSClient({ region: process.env.AWS_REGION || 'us-east-1' });
 
 const ORDER_TABLE_NAME = process.env.ORDER_COLLECTION_TABLE!;
 const TRANSACTION_TABLE_NAME = process.env.TRANSACTION_COLLECTION_TABLE!;
 const UPDATE_ORDER_QUEUE_URL = process.env.UPDATE_ORDER_QUEUE_URL!;
 
-enum PaymentStatus {
-  PENDING = "PENDING",
-  APPROVED = "APPROVED",
-  DECLINED = "DECLINED",
-  ERROR = "ERROR"
-}
+const PAYMENT_LIMITS = {
+  HIGH_VALUE_THRESHOLD: 10000,
+  MEDIUM_VALUE_THRESHOLD: 1000,
+} as const;
 
-enum OrderStatus {
-  PENDING = "PENDING",
-  PROCESSED = "PROCESSED",
-  PAYMENT_APPROVED = "PAYMENT_APPROVED",
-  PAYMENT_DECLINED = "PAYMENT_DECLINED"
-}
+const APPROVAL_RATES = {
+  HIGH_VALUE: 0.75,   // 75% approval rate for high-value transactions
+  MEDIUM_VALUE: 0.85, // 85% approval rate for medium-value transactions  
+  LOW_VALUE: 0.95,    // 95% approval rate for low-value transactions
+} as const;
 
-interface PaymentData {
-  cardNumber: string;
-  cardHolderName: string;
-  expiryMonth: string;
-  expiryYear: string;
-  cvv: string;
-  amount: number;
-}
+const GATEWAY_CONFIG = {
+  BASE_DELAY_MS: 200,
+  MAX_ADDITIONAL_DELAY_MS: 500,
+  FAILURE_RATE: 0.03, // 3% gateway failure rate
+} as const;
 
-interface AddressData {
-  street: string;
-  number: string;
-  complement?: string;
-  neighborhood: string;
-  city: string;
-  state: string;
-  zipCode: string;
-  country: string;
-}
-
-interface TransactionMessage {
+export interface TransactionMessage {
   orderId: string;
+  orderTotalValue: number;
   paymentData: PaymentData;
   addressData: AddressData;
-  customerInfo?: {
-    name: string;
-    email: string;
-    cpf: string;
-  };
+  customerData: CustomerData;
 }
 
-interface OrderRecord {
-  orderId: string;
-  leadId: string;
-  customerCpf: string;
-  customerEmail: string;
-  customerName: string;
-  items: any[];
-  totalItems: number;
-  totalValue: number;
-  status: OrderStatus;
-  source: string;
-  createdAt: string;
-  updatedAt: string;
-}
+type TransactionValueCategory = 'HIGH' | 'MEDIUM' | 'LOW';
 
-interface TransactionRecord {
-  transactionId: string;
-  orderId: string;
-  paymentData: PaymentData;
-  addressData: AddressData;
-  customerInfo: {
-    name: string;
-    email: string;
-    cpf: string;
-  };
-  paymentStatus: PaymentStatus;
-  amount: number;
+interface PaymentResult {
+  status: PaymentStatus;
+  processingTime: number;
   authCode?: string;
-  processingTime?: number;
-  source: string;
-  createdAt: string;
-  updatedAt: string;
+  errorMessage?: string;
+}
+
+function validateTransactionMessage(message: any): TransactionMessage {
+  const requiredFields = ['orderId', 'orderTotalValue', 'paymentData', 'addressData', 'customerData'];
+  const missingFields = requiredFields.filter(field => !message[field]);
+  
+  if (missingFields.length > 0) {
+    throw new Error(`Missing required fields: ${missingFields.join(', ')}`);
+  }
+
+  const paymentRequiredFields = ['cardNumber', 'cvv', 'expiryMonth', 'expiryYear', 'cardHolderName'];
+  const missingPaymentFields = paymentRequiredFields.filter(field => !message.paymentData[field]);
+  
+  if (missingPaymentFields.length > 0) {
+    throw new Error(`Missing payment data fields: ${missingPaymentFields.join(', ')}`);
+  }
+
+  return message as TransactionMessage;
+}
+
+function getTransactionValueCategory(totalValue: number): TransactionValueCategory {
+  if (totalValue >= PAYMENT_LIMITS.HIGH_VALUE_THRESHOLD) {
+    return 'HIGH';
+  }
+  if (totalValue >= PAYMENT_LIMITS.MEDIUM_VALUE_THRESHOLD) {
+    return 'MEDIUM';
+  }
+  return 'LOW';
+}
+
+function generateTransactionId(): string {
+  const timestamp = Date.now();
+  const randomPart = Math.random().toString(36).substring(2, 15);
+  return `txn-${timestamp}-${randomPart}`;
 }
 
 export const handler = async (event: SQSEvent): Promise<void> => {
@@ -108,79 +105,49 @@ export const handler = async (event: SQSEvent): Promise<void> => {
     functionName: "process-transaction",
   });
 
-  const mainTracker = new PerformanceTracker(logger, "transaction-batch");
+  const batchTracker = new PerformanceTracker(logger, "transaction-batch");
 
   logger.info("Processing transaction batch started", {
     recordsCount: event.Records.length,
   });
 
-  for (const [index, record] of event.Records.entries()) {
+  for (let i = 0; i < event.Records.length; i++) {
+    const record = event.Records[i];
     const recordLogger = logger.withContext({
-      recordIndex: index,
+      recordIndex: i,
       messageId: record.messageId,
     });
 
-    const recordTracker = new PerformanceTracker(
-      recordLogger,
-      "transaction-record"
-    );
-
-    recordLogger.info("Processing SQS record", {
-      receiptHandle: record.receiptHandle.substring(0, 50) + "...",
-      body: record.body.substring(0, 200) + "...",
-    });
+    const recordTracker = new PerformanceTracker(recordLogger, "transaction-record");
 
     try {
-      const message: TransactionMessage = JSON.parse(record.body);
-
-      const transactionLogger = recordLogger.withContext({
-        orderId: message.orderId,
+      recordLogger.info("Processing transaction record", {
+        eventSource: record.eventSource,
+        receiptHandle: record.receiptHandle?.substring(0, 30) + "...",
       });
 
-      transactionLogger.info("Transaction message parsed successfully", {
-        orderId: message.orderId,
-        amount: message.paymentData.amount,
-        cardLastFour: message.paymentData.cardNumber.slice(-4),
-        customerName: maskSensitiveData.name(message.customerInfo?.name || ""),
-        addressCity: message.addressData.city,
-        addressState: message.addressData.state,
-      });
+      const rawMessage = JSON.parse(record.body);
+      const transactionMessage = validateTransactionMessage(rawMessage);
 
-      const processingTracker = new PerformanceTracker(
-        transactionLogger,
-        "transaction-processing-logic"
-      );
-
-      transactionLogger.info("Starting transaction processing");
-
-      await processTransaction(message, transactionLogger);
-
-      processingTracker.finish({
-        orderId: message.orderId,
-        amount: message.paymentData.amount,
-      });
-
-      transactionLogger.info("Transaction processing completed successfully", {
-        orderId: message.orderId,
-        amount: message.paymentData.amount,
-      });
+      await processTransaction(transactionMessage, recordLogger);
 
       recordTracker.finish({
-        orderId: message.orderId,
+        orderId: transactionMessage.orderId,
         status: "success",
       });
-    } catch (error) {
+
+    } catch (error: any) {
       recordLogger.error("Error processing transaction record", error, {
         sqsMessagePreview: record.body.substring(0, 200),
+        errorType: error.constructor.name,
+        recordIndex: i,
       });
 
       recordTracker.finishWithError(error);
-
-      throw error;
     }
   }
 
-  mainTracker.finish({
+  batchTracker.finish({
     totalRecords: event.Records.length,
     status: "completed",
   });
@@ -192,154 +159,142 @@ export const handler = async (event: SQSEvent): Promise<void> => {
 
 async function processTransaction(
   message: TransactionMessage,
-  logger: any
+  logger: StructuredLogger
 ): Promise<void> {
-  const transactionTracker = new PerformanceTracker(
-    logger,
-    "payment-processing"
-  );
+  const transactionLogger = logger.withContext({ orderId: message.orderId });
+  const processingTracker = new PerformanceTracker(transactionLogger, "transaction-processing");
+
+  transactionLogger.info("Starting transaction processing", {
+    orderId: message.orderId,
+    amount: message.orderTotalValue,
+    valueCategory: getTransactionValueCategory(message.orderTotalValue),
+    cardLastFour: message.paymentData.cardNumber.slice(-4),
+    customerName: maskSensitiveData.name(message.customerData.name),
+    addressCity: message.addressData.city,
+    addressState: message.addressData.state,
+  });
 
   try {
-    logger.info("Starting payment processing", {
-      orderId: message.orderId,
-      amount: message.paymentData.amount,
-      cardLastFour: message.paymentData.cardNumber.slice(-4),
-      cardHolderName: maskSensitiveData.name(message.paymentData.cardHolderName),
-    });
-
-    const order = await getOrderById(message.orderId, logger);
-
+    const order = await getOrderById(message.orderId, transactionLogger);
     if (!order) {
-      const error = new Error(`Order not found: ${message.orderId}`);
-      logger.error("Order not found for transaction processing", error, {
-        orderId: message.orderId,
-      });
-      throw error;
+      throw new Error(`Order not found: ${message.orderId}`);
     }
 
-    logger.info("Order found for transaction processing", {
+    transactionLogger.info("Order found for processing", {
       orderId: message.orderId,
       currentStatus: order.status,
       totalValue: order.totalValue,
       leadId: order.leadId,
     });
 
-    const paymentResult = await processPayment(message.paymentData, logger);
-
-    const transactionId = `txn-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
-
-    if (!message.customerInfo) {
-      logger.error("Missing customer info in transaction message", null, {
-        orderId: message.orderId,
-      });
-      throw new Error("Customer info is required for transaction processing");
-    }
-
+    const paymentResult = await processPayment(message.paymentData, message.orderTotalValue, transactionLogger);
+    
+    const transactionId = generateTransactionId();
     await createTransactionRecord(
       transactionId,
       message.orderId,
+      message.orderTotalValue,
       message.paymentData,
       message.addressData,
-      message.customerInfo,
+      message.customerData,
       paymentResult,
-      logger
+      transactionLogger
     );
 
-    const finalStatus = paymentResult.status === PaymentStatus.APPROVED 
-      ? "PROCESSED" 
-      : "CANCELLED";
+    const finalOrderStatus = paymentResult.status === PaymentStatus.APPROVED 
+      ? OrderStatus.PROCESSED 
+      : OrderStatus.CANCELLED;
     
-    await sendUpdateOrderMessage(
+    const statusReason = paymentResult.status === PaymentStatus.APPROVED
+      ? `Payment approved: ${paymentResult.authCode}`
+      : `Payment ${paymentResult.status.toLowerCase()}: ${paymentResult.errorMessage || 'Processing failed'}`;
+
+    await sendOrderUpdateMessage(
       message.orderId,
-      finalStatus,
-      `Payment ${paymentResult.status.toLowerCase()}: ${paymentResult.authCode || 'No auth code'}`,
+      finalOrderStatus,
+      statusReason,
       transactionId,
-      logger
+      transactionLogger
     );
 
-    transactionTracker.finish({
+    processingTracker.finish({
       orderId: message.orderId,
-      transactionId: transactionId,
+      transactionId,
       paymentStatus: paymentResult.status,
-      amount: message.paymentData.amount,
-    });
-
-    logger.info("Payment processing completed successfully", {
-      orderId: message.orderId,
-      transactionId: transactionId,
-      paymentStatus: paymentResult.status,
-      amount: message.paymentData.amount,
+      amount: message.orderTotalValue,
       processingTime: paymentResult.processingTime,
     });
 
-  } catch (error: any) {
-    logger.error("Failed to process payment transaction", error, {
+    transactionLogger.info("Transaction processing completed successfully", {
       orderId: message.orderId,
-      amount: message.paymentData.amount,
-      errorName: error.name,
+      transactionId,
+      paymentStatus: paymentResult.status,
+      finalOrderStatus,
+    });
+
+  } catch (error: any) {
+    transactionLogger.error("Transaction processing failed", error, {
+      orderId: message.orderId,
+      amount: message.orderTotalValue,
     });
 
     try {
-      const transactionId = `txn-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
-      
-      const defaultCustomerInfo = message.customerInfo || {
-        name: "Unknown Customer",
-        email: "unknown@domain.com",
-        cpf: "000.000.000-00"
-      };
-      
+      const errorTransactionId = generateTransactionId();
       await createTransactionRecord(
-        transactionId,
+        errorTransactionId,
         message.orderId,
+        message.orderTotalValue,
         message.paymentData,
         message.addressData,
-        defaultCustomerInfo,
-        { status: PaymentStatus.ERROR, processingTime: 0 },
-        logger
+        message.customerData,
+        {
+          status: PaymentStatus.ERROR,
+          processingTime: 0,
+          errorMessage: error.message,
+        },
+        transactionLogger
       );
-      
-      await sendUpdateOrderMessage(
+
+      await sendOrderUpdateMessage(
         message.orderId,
-        "CANCELLED",
+        OrderStatus.CANCELLED,
         `Payment processing error: ${error.message}`,
-        transactionId,
-        logger
+        errorTransactionId,
+        transactionLogger
       );
-    } catch (updateError) {
-      logger.error("Failed to create error transaction record", updateError, {
+    } catch (recordError) {
+      transactionLogger.error("Failed to create error transaction record", recordError, {
         orderId: message.orderId,
       });
     }
 
-    transactionTracker.finishWithError(error);
+    processingTracker.finishWithError(error);
     throw error;
   }
 }
 
 async function processPayment(
   paymentData: PaymentData,
-  logger: any
-): Promise<{ status: PaymentStatus; processingTime: number; authCode?: string }> {
-  const paymentTracker = new PerformanceTracker(
-    logger,
-    "payment-gateway-call"
-  );
-
+  totalValue: number,
+  logger: StructuredLogger
+): Promise<PaymentResult> {
+  const paymentTracker = new PerformanceTracker(logger, "payment-gateway-call");
   const startTime = Date.now();
 
+  logger.info("Processing payment with gateway", {
+    amount: totalValue,
+    valueCategory: getTransactionValueCategory(totalValue),
+    cardLastFour: paymentData.cardNumber.slice(-4),
+    cardHolderName: maskSensitiveData.name(paymentData.cardHolderName),
+  });
+
   try {
-    logger.info("Processing payment with gateway", {
-      amount: paymentData.amount,
-      cardLastFour: paymentData.cardNumber.slice(-4),
-      cardHolderName: maskSensitiveData.name(paymentData.cardHolderName),
-    });
+    await simulatePaymentGatewayCall();
 
-    await simulatePaymentGatewayCall(paymentData);
-
-    const isApproved = simulatePaymentApproval(paymentData);
+    const isApproved = simulatePaymentApproval(paymentData, totalValue);
     const processingTime = Date.now() - startTime;
 
-    const result = {
+    const result: PaymentResult = {
       status: isApproved ? PaymentStatus.APPROVED : PaymentStatus.DECLINED,
       processingTime,
       authCode: isApproved ? `AUTH-${Date.now()}` : undefined,
@@ -348,24 +303,24 @@ async function processPayment(
     paymentTracker.finish({
       status: result.status,
       processingTime: result.processingTime,
-      amount: paymentData.amount,
+      amount: totalValue,
     });
 
     logger.info("Payment gateway response received", {
       status: result.status,
       processingTime: result.processingTime,
       authCode: result.authCode,
-      amount: paymentData.amount,
+      amount: totalValue,
     });
 
     return result;
 
-  } catch (error) {
+  } catch (error: any) {
     const processingTime = Date.now() - startTime;
     
     logger.error("Payment gateway call failed", error, {
-      amount: paymentData.amount,
-      processingTime: processingTime,
+      amount: totalValue,
+      processingTime,
     });
 
     paymentTracker.finishWithError(error);
@@ -373,89 +328,93 @@ async function processPayment(
     return {
       status: PaymentStatus.ERROR,
       processingTime,
+      errorMessage: error.message,
     };
   }
 }
 
-async function simulatePaymentGatewayCall(paymentData: PaymentData): Promise<void> {
-  const delay = Math.random() * 1000 + 500;
-  await new Promise(resolve => setTimeout(resolve, delay));
+async function simulatePaymentGatewayCall(): Promise<void> {
+  const totalDelay = GATEWAY_CONFIG.BASE_DELAY_MS + 
+    (Math.random() * GATEWAY_CONFIG.MAX_ADDITIONAL_DELAY_MS);
+  
+  await new Promise((resolve) => setTimeout(resolve, totalDelay));
 
-  if (Math.random() < 0.05) {
-    throw new Error("Payment gateway timeout");
+  if (Math.random() < GATEWAY_CONFIG.FAILURE_RATE) {
+    const errorTypes = [
+      "Payment gateway timeout",
+      "Payment gateway service unavailable", 
+      "Invalid merchant configuration",
+      "Network connection error"
+    ];
+    const randomError = errorTypes[Math.floor(Math.random() * errorTypes.length)];
+    throw new Error(randomError);
   }
 }
 
-function simulatePaymentApproval(paymentData: PaymentData): boolean {
+function simulatePaymentApproval(paymentData: PaymentData, totalValue: number): boolean {
   if (paymentData.cardNumber.endsWith("0000")) {
     return false;
   }
 
-  if (paymentData.amount > 10000) {
-    return Math.random() > 0.2;
+  const valueCategory = getTransactionValueCategory(totalValue);
+  let approvalRate: number;
+  
+  switch (valueCategory) {
+    case 'HIGH':
+      approvalRate = APPROVAL_RATES.HIGH_VALUE;
+      break;
+    case 'MEDIUM':
+      approvalRate = APPROVAL_RATES.MEDIUM_VALUE;
+      break;
+    case 'LOW':
+      approvalRate = APPROVAL_RATES.LOW_VALUE;
+      break;
   }
 
-  return Math.random() > 0.1;
+  return Math.random() < approvalRate;
 }
 
-async function getOrderById(
-  orderId: string,
-  logger: any
-): Promise<OrderRecord | null> {
-  const orderTracker = new PerformanceTracker(
-    logger,
-    "order-lookup"
-  );
+async function getOrderById(orderId: string, logger: StructuredLogger): Promise<OrderData | null> {
+  const orderTracker = new PerformanceTracker(logger, "order-lookup");
 
   try {
-    logger.info("Looking up order for transaction", {
-      orderId: orderId,
-    });
+    logger.info("Looking up order", { orderId });
 
     const getCommand = new GetCommand({
       TableName: ORDER_TABLE_NAME,
-      Key: {
-        orderId: orderId,
-      },
+      Key: { orderId },
     });
 
     const result = await docClient.send(getCommand);
 
     if (result.Item) {
-      const order: OrderRecord = result.Item as OrderRecord;
-
-      logger.info("Order found for transaction", {
-        orderId: orderId,
-        status: order.status,
-        totalValue: order.totalValue,
-        leadId: order.leadId,
-        totalItems: order.totalItems,
-      });
-
+      const order = result.Item as OrderData;
+      
       orderTracker.finish({
-        orderId: orderId,
+        orderId,
         found: true,
         status: order.status,
       });
 
-      return order;
-    } else {
-      logger.warn("Order not found for transaction", {
-        orderId: orderId,
+      logger.info("Order found", {
+        orderId,
+        status: order.status,
+        totalValue: order.totalValue,
+        leadId: order.leadId,
       });
 
+      return order;
+    } else {
       orderTracker.finish({
-        orderId: orderId,
+        orderId,
         found: false,
       });
 
+      logger.warn("Order not found", { orderId });
       return null;
     }
   } catch (error) {
-    logger.error("Error looking up order for transaction", error, {
-      orderId: orderId,
-    });
-
+    logger.error("Error looking up order", error, { orderId });
     orderTracker.finishWithError(error);
     throw error;
   }
@@ -464,23 +423,21 @@ async function getOrderById(
 async function createTransactionRecord(
   transactionId: string,
   orderId: string,
+  totalValue: number,
   paymentData: PaymentData,
   addressData: AddressData,
-  customerInfo: { name: string; email: string; cpf: string },
-  paymentResult: { status: PaymentStatus; processingTime: number; authCode?: string },
-  logger: any
+  customerData: CustomerData,
+  paymentResult: PaymentResult,
+  logger: StructuredLogger
 ): Promise<void> {
-  const transactionTracker = new PerformanceTracker(
-    logger,
-    "transaction-record-creation"
-  );
+  const transactionTracker = new PerformanceTracker(logger, "transaction-record-creation");
 
   try {
     logger.info("Creating transaction record", {
-      transactionId: transactionId,
-      orderId: orderId,
+      transactionId,
+      orderId,
       paymentStatus: paymentResult.status,
-      amount: paymentData.amount,
+      amount: totalValue,
     });
 
     const maskedPaymentData = {
@@ -489,21 +446,20 @@ async function createTransactionRecord(
       cvv: "***",
     };
 
-    const transactionRecord: TransactionRecord = {
-      transactionId: transactionId,
-      orderId: orderId,
+    const transactionRecord: TransactionData = {
+      id: transactionId,
+      orderId,
       paymentData: maskedPaymentData,
-      addressData: addressData,
-      customerInfo: {
-        name: customerInfo.name,
-        email: customerInfo.email,
-        cpf: maskSensitiveData.cpf(customerInfo.cpf),
+      addressData,
+      customerData: {
+        name: customerData.name,
+        email: customerData.email,
+        cpf: maskSensitiveData.cpf(customerData.cpf),
       },
       paymentStatus: paymentResult.status,
-      amount: paymentData.amount,
+      amount: totalValue,
       authCode: paymentResult.authCode,
       processingTime: paymentResult.processingTime,
-      source: "payment-processing-service",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -511,36 +467,31 @@ async function createTransactionRecord(
     const putCommand = new PutCommand({
       TableName: TRANSACTION_TABLE_NAME,
       Item: transactionRecord,
-      ConditionExpression: "attribute_not_exists(transactionId)",
+      ConditionExpression: "attribute_not_exists(id)",
     });
 
     await docClient.send(putCommand);
 
     transactionTracker.finish({
-      transactionId: transactionId,
-      orderId: orderId,
+      transactionId,
+      orderId,
       paymentStatus: paymentResult.status,
-      amount: paymentData.amount,
+      amount: totalValue,
     });
 
     logger.info("Transaction record created successfully", {
-      transactionId: transactionId,
-      orderId: orderId,
+      transactionId,
+      orderId,
       paymentStatus: paymentResult.status,
-      amount: paymentData.amount,
-      authCode: paymentResult.authCode,
+      amount: totalValue,
       processingTime: paymentResult.processingTime,
-      cardLastFour: paymentData.cardNumber.slice(-4),
-      addressCity: addressData.city,
-      addressState: addressData.state,
     });
 
   } catch (error: any) {
     logger.error("Failed to create transaction record", error, {
-      transactionId: transactionId,
-      orderId: orderId,
+      transactionId,
+      orderId,
       paymentStatus: paymentResult.status,
-      errorName: error.name,
     });
 
     transactionTracker.finishWithError(error);
@@ -548,93 +499,33 @@ async function createTransactionRecord(
   }
 }
 
-async function updateOrderStatus(
+async function sendOrderUpdateMessage(
   orderId: string,
-  newStatus: OrderStatus,
-  logger: any
-): Promise<void> {
-  const updateTracker = new PerformanceTracker(
-    logger,
-    "order-status-update"
-  );
-
-  try {
-    logger.info("Updating order status", {
-      orderId: orderId,
-      newStatus: newStatus,
-    });
-
-    const updateCommand = new UpdateCommand({
-      TableName: ORDER_TABLE_NAME,
-      Key: {
-        orderId: orderId,
-      },
-      UpdateExpression: "SET #status = :status, updatedAt = :updatedAt",
-      ExpressionAttributeNames: {
-        "#status": "status",
-      },
-      ExpressionAttributeValues: {
-        ":status": newStatus,
-        ":updatedAt": new Date().toISOString(),
-      },
-      ReturnValues: "ALL_NEW",
-    });
-
-    const result = await docClient.send(updateCommand);
-
-    updateTracker.finish({
-      orderId: orderId,
-      newStatus: newStatus,
-    });
-
-    logger.info("Order status updated successfully", {
-      orderId: orderId,
-      previousStatus: "PENDING",
-      newStatus: newStatus,
-    });
-
-  } catch (error: any) {
-    logger.error("Failed to update order status", error, {
-      orderId: orderId,
-      newStatus: newStatus,
-      errorName: error.name,
-    });
-
-    updateTracker.finishWithError(error);
-    throw error;
-  }
-}
-
-async function sendUpdateOrderMessage(
-  orderId: string,
-  status: string,
+  status: OrderStatus,
   reason: string,
   transactionId: string,
-  logger: any
+  logger: StructuredLogger
 ): Promise<void> {
-  const messageTracker = new PerformanceTracker(
-    logger,
-    "update-order-message-send"
-  );
+  const messageTracker = new PerformanceTracker(logger, "order-update-message");
 
   try {
-    logger.info("Sending update order message", {
-      orderId: orderId,
-      status: status,
-      reason: reason,
-      transactionId: transactionId,
+    logger.info("Sending order update message", {
+      orderId,
+      status,
+      reason,
+      transactionId,
     });
 
-    const updateOrderMessage = {
-      orderId: orderId,
-      status: status,
-      reason: reason,
-      transactionId: transactionId
+    const updateMessage = {
+      orderId,
+      status,
+      reason,
+      transactionId,
     };
 
     const sendCommand = new SendMessageCommand({
       QueueUrl: UPDATE_ORDER_QUEUE_URL,
-      MessageBody: JSON.stringify(updateOrderMessage),
+      MessageBody: JSON.stringify(updateMessage),
       MessageAttributes: {
         orderId: {
           DataType: "String",
@@ -647,31 +538,31 @@ async function sendUpdateOrderMessage(
         transactionId: {
           DataType: "String",
           StringValue: transactionId,
-        }
+        },
       },
     });
 
     const result = await sqsClient.send(sendCommand);
 
     messageTracker.finish({
-      orderId: orderId,
-      status: status,
+      orderId,
+      status,
       messageId: result.MessageId,
     });
 
-    logger.info("Update order message sent successfully", {
-      orderId: orderId,
-      status: status,
-      reason: reason,
-      transactionId: transactionId,
+    logger.info("Order update message sent successfully", {
+      orderId,
+      status,
+      reason,
+      transactionId,
       messageId: result.MessageId,
     });
 
   } catch (error: any) {
-    logger.error("Failed to send update order message", error, {
-      orderId: orderId,
-      status: status,
-      errorName: error.name,
+    logger.error("Failed to send order update message", error, {
+      orderId,
+      status,
+      transactionId,
     });
 
     messageTracker.finishWithError(error);

@@ -1,3 +1,6 @@
+import { BodyData } from "../lambdas/order/initialize-order";
+import { CustomerData } from "./schemas/order";
+
 export interface ValidationResult {
   isValid: boolean;
   error?: string;
@@ -14,7 +17,6 @@ export interface PaymentData {
   expiryMonth: string;
   expiryYear: string;
   cvv: string;
-  amount: number;
 }
 
 export interface AddressData {
@@ -28,11 +30,9 @@ export interface AddressData {
   country: string;
 }
 
-export interface CreateOrderData {
-  cpf: string;
-  email: string;
-  name: string;
+export interface SanitizedInitializedOrderData {
   items: OrderItem[];
+  customerData: CustomerData;
   paymentData: PaymentData;
   addressData: AddressData;
 }
@@ -124,22 +124,43 @@ export const validateOrderItems = (items: any): ValidationResult => {
 
 export const validatePaymentData = (paymentData: any): ValidationResult => {
   if (!paymentData || typeof paymentData !== "object") {
-    return { isValid: false, error: "Payment data is required and must be an object" };
+    return {
+      isValid: false,
+      error: "Payment data is required and must be an object",
+    };
   }
 
-  const requiredFields = ["cardNumber", "cardHolderName", "expiryMonth", "expiryYear", "cvv", "amount"];
+  const requiredFields = [
+    "cardNumber",
+    "cardHolderName",
+    "expiryMonth",
+    "expiryYear",
+    "cvv",
+  ];
   for (const field of requiredFields) {
     if (!(field in paymentData)) {
-      return { isValid: false, error: `Missing required payment field: ${field}` };
+      return {
+        isValid: false,
+        error: `Missing required payment field: ${field}`,
+      };
     }
   }
 
-  if (typeof paymentData.cardNumber !== "string" || !/^\d{16}$/.test(paymentData.cardNumber)) {
+  if (
+    typeof paymentData.cardNumber !== "string" ||
+    !/^\d{16}$/.test(paymentData.cardNumber)
+  ) {
     return { isValid: false, error: "Card number must be 16 digits" };
   }
 
-  if (typeof paymentData.cardHolderName !== "string" || paymentData.cardHolderName.trim().length < 2) {
-    return { isValid: false, error: "Card holder name is required and must have at least 2 characters" };
+  if (
+    typeof paymentData.cardHolderName !== "string" ||
+    paymentData.cardHolderName.trim().length < 2
+  ) {
+    return {
+      isValid: false,
+      error: "Card holder name is required and must have at least 2 characters",
+    };
   }
 
   const expiryMonth = parseInt(paymentData.expiryMonth, 10);
@@ -149,16 +170,23 @@ export const validatePaymentData = (paymentData: any): ValidationResult => {
 
   const expiryYear = parseInt(paymentData.expiryYear, 10);
   const currentYear = new Date().getFullYear();
-  if (isNaN(expiryYear) || expiryYear < currentYear || expiryYear > currentYear + 10) {
-    return { isValid: false, error: "Expiry year must be valid and not more than 10 years in the future" };
+  if (
+    isNaN(expiryYear) ||
+    expiryYear < currentYear ||
+    expiryYear > currentYear + 10
+  ) {
+    return {
+      isValid: false,
+      error:
+        "Expiry year must be valid and not more than 10 years in the future",
+    };
   }
 
-  if (typeof paymentData.cvv !== "string" || !/^\d{3,4}$/.test(paymentData.cvv)) {
+  if (
+    typeof paymentData.cvv !== "string" ||
+    !/^\d{3,4}$/.test(paymentData.cvv)
+  ) {
     return { isValid: false, error: "CVV must be 3 or 4 digits" };
-  }
-
-  if (typeof paymentData.amount !== "number" || paymentData.amount <= 0) {
-    return { isValid: false, error: "Amount must be a positive number" };
   }
 
   return { isValid: true };
@@ -166,25 +194,58 @@ export const validatePaymentData = (paymentData: any): ValidationResult => {
 
 export const validateAddressData = (addressData: any): ValidationResult => {
   if (!addressData || typeof addressData !== "object") {
-    return { isValid: false, error: "Address data is required and must be an object" };
+    return {
+      isValid: false,
+      error: "Address data is required and must be an object",
+    };
   }
 
-  const requiredFields = ["street", "number", "neighborhood", "city", "state", "zipCode", "country"];
+  const requiredFields = [
+    "street",
+    "number",
+    "neighborhood",
+    "city",
+    "state",
+    "zipCode",
+    "country",
+  ];
   for (const field of requiredFields) {
     if (!(field in addressData)) {
-      return { isValid: false, error: `Missing required address field: ${field}` };
+      return {
+        isValid: false,
+        error: `Missing required address field: ${field}`,
+      };
     }
   }
 
-  const stringFields = ["street", "number", "neighborhood", "city", "state", "country"];
+  const stringFields = [
+    "street",
+    "number",
+    "neighborhood",
+    "city",
+    "state",
+    "country",
+  ];
   for (const field of stringFields) {
-    if (typeof addressData[field] !== "string" || addressData[field].trim().length === 0) {
-      return { isValid: false, error: `${field} is required and must be a non-empty string` };
+    if (
+      typeof addressData[field] !== "string" ||
+      addressData[field].trim().length === 0
+    ) {
+      return {
+        isValid: false,
+        error: `${field} is required and must be a non-empty string`,
+      };
     }
   }
 
-  if (typeof addressData.zipCode !== "string" || !/^\d{5}-?\d{3}$/.test(addressData.zipCode)) {
-    return { isValid: false, error: "ZIP code must be in format XXXXX-XXX or XXXXXXXX" };
+  if (
+    typeof addressData.zipCode !== "string" ||
+    !/^\d{5}-?\d{3}$/.test(addressData.zipCode)
+  ) {
+    return {
+      isValid: false,
+      error: "ZIP code must be in format XXXXX-XXX or XXXXXXXX",
+    };
   }
 
   if (addressData.complement && typeof addressData.complement !== "string") {
@@ -194,7 +255,9 @@ export const validateAddressData = (addressData: any): ValidationResult => {
   return { isValid: true };
 };
 
-export const validateCreateOrderData = (data: any): ValidationResult => {
+export const validateInitializeOrderData = (
+  data: BodyData
+): ValidationResult => {
   if (!data || typeof data !== "object") {
     return {
       isValid: false,
@@ -202,24 +265,28 @@ export const validateCreateOrderData = (data: any): ValidationResult => {
     };
   }
 
-  const requiredFields = ["cpf", "email", "name", "items", "paymentData", "addressData"];
+  const requiredFields = [
+    "customerData",
+    "paymentData",
+    "addressData",
+  ];
   for (const field of requiredFields) {
     if (!(field in data)) {
       return { isValid: false, error: `Missing required field: ${field}` };
     }
   }
 
-  const cpfValidation = validateCPF(data.cpf);
+  const cpfValidation = validateCPF(data.customerData.cpf);
   if (!cpfValidation.isValid) {
     return cpfValidation;
   }
 
-  const emailValidation = validateEmail(data.email);
+  const emailValidation = validateEmail(data.customerData.email);
   if (!emailValidation.isValid) {
     return emailValidation;
   }
 
-  const nameValidation = validateName(data.name);
+  const nameValidation = validateName(data.customerData.name);
   if (!nameValidation.isValid) {
     return nameValidation;
   }
@@ -262,31 +329,36 @@ export const createSuccessResponse = (statusCode: number, data: any) => {
   };
 };
 
-export const sanitizeCreateOrderData = (data: any): CreateOrderData => {
+export const sanitizeInitializeOrderData = (data: BodyData): SanitizedInitializedOrderData => {
   return {
-    cpf: data.cpf.trim(),
-    email: data.email.toLowerCase().trim(),
-    name: data.name.trim(),
     items: data.items.map((item: any) => ({
       id: item.id.trim(),
       quantity: parseInt(item.quantity, 10),
     })),
+    customerData: {
+      cpf: data.customerData.cpf.trim(),
+      email: data.customerData.email.toLowerCase().trim(),
+      name: data.customerData.name.trim(),
+    },
     paymentData: {
-      cardNumber: data.paymentData.cardNumber.replace(/\s/g, ''),
+      cardNumber: data.paymentData.cardNumber.replace(/\s/g, ""),
       cardHolderName: data.paymentData.cardHolderName.trim().toUpperCase(),
-      expiryMonth: data.paymentData.expiryMonth.toString().padStart(2, '0'),
+      expiryMonth: data.paymentData.expiryMonth.toString().padStart(2, "0"),
       expiryYear: data.paymentData.expiryYear.toString(),
       cvv: data.paymentData.cvv.trim(),
-      amount: parseFloat(data.paymentData.amount),
     },
     addressData: {
       street: data.addressData.street.trim(),
       number: data.addressData.number.trim(),
-      complement: data.addressData.complement ? data.addressData.complement.trim() : undefined,
+      complement: data.addressData.complement
+        ? data.addressData.complement.trim()
+        : undefined,
       neighborhood: data.addressData.neighborhood.trim(),
       city: data.addressData.city.trim(),
       state: data.addressData.state.trim().toUpperCase(),
-      zipCode: data.addressData.zipCode.replace(/\D/g, '').replace(/(\d{5})(\d{3})/, '$1-$2'),
+      zipCode: data.addressData.zipCode
+        .replace(/\D/g, "")
+        .replace(/(\d{5})(\d{3})/, "$1-$2"),
       country: data.addressData.country.trim().toUpperCase(),
     },
   };

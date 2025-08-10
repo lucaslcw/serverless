@@ -51,7 +51,7 @@ export const maskSensitiveData = {
   },
 };
 
-class StructuredLogger {
+export class StructuredLogger {
   private context: LogContext;
 
   constructor(context: LogContext = {}) {

@@ -1,10 +1,11 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { SNS } from "aws-sdk";
 import {
-  validateCreateOrderData,
-  sanitizeCreateOrderData,
+  validateInitializeOrderData,
+  sanitizeInitializeOrderData,
   createErrorResponse,
   createSuccessResponse,
+  PaymentData,
 } from "../../shared/validators";
 import {
   createLogger,
@@ -12,6 +13,22 @@ import {
   maskSensitiveData,
   PerformanceTracker,
 } from "../../shared/logger";
+import {
+  AddressData,
+  CustomerData,
+  OrderItem,
+} from "../../shared/schemas/order";
+
+export type BodyData = {
+  paymentData: PaymentData;
+  addressData: AddressData;
+  customerData: CustomerData;
+  items: Pick<OrderItem, "quantity" | "id">[];
+};
+
+export interface MessageData extends BodyData {
+  orderId: string;
+}
 
 const sns = new SNS();
 
@@ -35,14 +52,14 @@ export const handler = async (
       bodyLength: event.body?.length || 0,
     });
 
-    const rawData = JSON.parse(event.body || "{}");
+    const rawData = JSON.parse(event.body || "{}") as BodyData;
 
     logger.info("Request data parsed", {
       fieldsReceived: Object.keys(rawData),
       itemsCount: Array.isArray(rawData.items) ? rawData.items.length : 0,
     });
 
-    const validation = validateCreateOrderData(rawData);
+    const validation = validateInitializeOrderData(rawData);
     if (!validation.isValid) {
       logger.warn("Validation failed", {
         error: validation.error,
@@ -52,27 +69,27 @@ export const handler = async (
       return createErrorResponse(400, validation.error!);
     }
 
-    const orderData = sanitizeCreateOrderData(rawData);
+    const orderData = sanitizeInitializeOrderData(rawData);
 
-    const orderRequest = {
-      orderId: `order-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      cpf: orderData.cpf,
-      email: orderData.email,
-      name: orderData.name,
+    const orderId = `order-${Date.now()}-${Math.random()
+      .toString(36)
+      .substr(2, 9)}`;
+
+    const messageData: MessageData = {
+      orderId,
       items: orderData.items,
       paymentData: orderData.paymentData,
       addressData: orderData.addressData,
-      timestamp: new Date().toISOString(),
-      status: "requested",
+      customerData: orderData.customerData,
     };
 
-    const orderLogger = logger.withContext({ orderId: orderRequest.orderId });
-    orderLogger.info("Order created", {
-      customerCpf: maskSensitiveData.cpf(orderRequest.cpf),
-      customerEmail: maskSensitiveData.email(orderRequest.email),
-      customerName: maskSensitiveData.name(orderRequest.name),
-      itemsCount: orderRequest.items.length,
-      totalQuantity: orderRequest.items.reduce(
+    const orderLogger = logger.withContext({ orderId: messageData.orderId });
+    orderLogger.info("Message data mounted", {
+      cpf: maskSensitiveData.cpf(messageData.customerData.cpf),
+      email: maskSensitiveData.email(messageData.customerData.email),
+      name: maskSensitiveData.name(messageData.customerData.name),
+      itemsCount: messageData.items.length,
+      totalQuantity: messageData.items.reduce(
         (total, item) => total + item.quantity,
         0
       ),
@@ -80,12 +97,12 @@ export const handler = async (
 
     const params = {
       TopicArn: process.env.INITIALIZE_ORDER_TOPIC_ARN!,
-      Message: JSON.stringify(orderRequest),
+      Message: JSON.stringify(messageData),
       Subject: "New Order Request",
       MessageAttributes: {
         messageType: {
           DataType: "String",
-          StringValue: "order_created",
+          StringValue: "order_initialized",
         },
       },
     };
@@ -94,18 +111,18 @@ export const handler = async (
     await sns.publish(params).promise();
     snsTracker.finish({
       topicArn: process.env.INITIALIZE_ORDER_TOPIC_ARN,
-      messageSize: JSON.stringify(orderRequest).length,
+      messageSize: JSON.stringify(messageData).length,
     });
 
     const response = createSuccessResponse(202, {
       message: "Order request submitted successfully",
-      orderId: orderRequest.orderId,
+      orderId: messageData.orderId,
       status: "submitted",
     });
 
     tracker.finish({
       statusCode: 202,
-      orderId: orderRequest.orderId,
+      orderId: messageData.orderId,
     });
 
     return response;

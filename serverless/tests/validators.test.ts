@@ -3,7 +3,9 @@ import {
   validateEmail, 
   validateName,
   validateOrderItems, 
-  validateCreateOrderData 
+  validateInitializeOrderData,
+  validatePaymentData,
+  validateAddressData
 } from '../shared/validators';
 
 describe('Validators', () => {
@@ -115,20 +117,80 @@ describe('Validators', () => {
     });
   });
 
-  describe('validateCreateOrderData', () => {
+  describe('validatePaymentData', () => {
+    test('should validate valid payment data', () => {
+      const paymentData = {
+        cardNumber: '1234567890123456',
+        cardHolderName: 'JOAO SILVA',
+        expiryMonth: '12',
+        expiryYear: '2026',
+        cvv: '123'
+      };
+      const result = validatePaymentData(paymentData);
+      expect(result.isValid).toBe(true);
+    });
+
+    test('should reject invalid card number', () => {
+      const paymentData = {
+        cardNumber: '123456',
+        cardHolderName: 'JOAO SILVA',
+        expiryMonth: '12',
+        expiryYear: '2026',
+        cvv: '123'
+      };
+      const result = validatePaymentData(paymentData);
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain('Card number must be 16 digits');
+    });
+  });
+
+  describe('validateAddressData', () => {
+    test('should validate valid address data', () => {
+      const addressData = {
+        street: 'Rua das Flores',
+        number: '123',
+        complement: 'Apto 101',
+        neighborhood: 'Centro',
+        city: 'São Paulo',
+        state: 'SP',
+        zipCode: '01234-567',
+        country: 'BRASIL'
+      };
+      const result = validateAddressData(addressData);
+      expect(result.isValid).toBe(true);
+    });
+
+    test('should reject invalid zip code', () => {
+      const addressData = {
+        street: 'Rua das Flores',
+        number: '123',
+        neighborhood: 'Centro',
+        city: 'São Paulo',
+        state: 'SP',
+        zipCode: '123',
+        country: 'BRASIL'
+      };
+      const result = validateAddressData(addressData);
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain('ZIP code must be in format');
+    });
+  });
+
+  describe('validateInitializeOrderData', () => {
     test('should validate complete valid order data', () => {
       const data = {
-        cpf: '123.456.789-01',
-        email: 'test@example.com',
-        name: 'João Silva',
+        customerData: {
+          cpf: '123.456.789-01',
+          email: 'test@example.com',
+          name: 'João Silva'
+        },
         items: [{ id: 'item1', quantity: 2 }],
         paymentData: {
           cardNumber: '1234567890123456',
           cardHolderName: 'JOAO SILVA',
           expiryMonth: '12',
           expiryYear: '2026',
-          cvv: '123',
-          amount: 100.00
+          cvv: '123'
         },
         addressData: {
           street: 'Rua das Flores',
@@ -141,15 +203,21 @@ describe('Validators', () => {
           country: 'BRASIL'
         }
       };
-      const result = validateCreateOrderData(data);
+      const result = validateInitializeOrderData(data);
       expect(result.isValid).toBe(true);
     });
 
     test('should reject data with missing fields', () => {
       const data = {
-        cpf: '123.456.789-01'
+        customerData: {
+          cpf: '123.456.789-01',
+          email: 'test@example.com',
+          name: 'João Silva'
+        },
+        items: [{ id: 'item1', quantity: 2 }],
+        // missing paymentData and addressData
       };
-      const result = validateCreateOrderData(data);
+      const result = validateInitializeOrderData(data as any);
       expect(result.isValid).toBe(false);
       expect(result.error).toContain('Missing required field');
     });

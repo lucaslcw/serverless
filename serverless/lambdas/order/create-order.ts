@@ -13,7 +13,20 @@ import {
   generateCorrelationId,
   maskSensitiveData,
   PerformanceTracker,
+  StructuredLogger,
 } from "../../shared/logger";
+import { MessageData } from "./initialize-order";
+import {
+  AddressData,
+  CustomerData,
+  OrderData,
+  OrderItem,
+  OrderStatus,
+  PaymentData,
+} from "../../shared/schemas/order";
+import { TransactionMessage } from "../transaction/process-transaction";
+import { LeadData } from "../../shared/schemas/lead";
+import { ProductData } from "../../shared/schemas/product";
 
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
 const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
@@ -23,12 +36,8 @@ const LEAD_TABLE_NAME = process.env.LEAD_COLLECTION_TABLE!;
 const ORDER_TABLE_NAME = process.env.ORDER_COLLECTION_TABLE!;
 const PRODUCT_TABLE_NAME = process.env.PRODUCT_COLLECTION_TABLE!;
 const PRODUCT_STOCK_QUEUE_URL = process.env.PRODUCT_STOCK_QUEUE_URL!;
-const PROCESS_TRANSACTION_QUEUE_URL = process.env.PROCESS_TRANSACTION_QUEUE_URL!;
-
-enum OrderStatus {
-  PENDING = "PENDING",
-  PROCESSED = "PROCESSED",
-}
+const PROCESS_TRANSACTION_QUEUE_URL =
+  process.env.PROCESS_TRANSACTION_QUEUE_URL!;
 
 enum StockOperationType {
   DECREASE = "DECREASE",
@@ -43,72 +52,10 @@ interface StockUpdateMessage {
   reason?: string;
 }
 
-interface TransactionMessage {
-  orderId: string;
-  paymentData: any;
-  addressData: any;
-  customerInfo: {
-    name: string;
-    email: string;
-    cpf: string;
-  };
-}
-
-interface OrderItem {
-  id: string;
-  quantity: number;
-  productName?: string;
-  unitPrice?: number;
-  totalPrice?: number;
-  hasStockControl?: boolean;
-}
-
-interface Product {
-  productId: string;
-  name: string;
-  price: number;
-  category: string;
-  description?: string;
-  isActive: boolean;
-  quantityInStock?: number;
-}
-
-interface OrderData {
-  orderId: string;
-  cpf: string;
-  email: string;
-  name: string;
-  items: OrderItem[];
-  paymentData?: any;
-  addressData?: any;
-  timestamp: string;
-  status: string;
-}
-
-interface ExistingLead {
-  id: string;
-  leadId: string;
-  customerCpf: string;
-  customerEmail: string;
-  customerName: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface OrderRecord {
-  orderId: string;
-  leadId: string;
-  customerCpf: string;
-  customerEmail: string;
-  customerName: string;
-  items: OrderItem[];
-  totalItems: number;
-  totalValue: number;
-  status: OrderStatus;
-  source: string;
-  createdAt: string;
-  updatedAt: string;
-}
+type ExistingLead = Pick<
+  LeadData,
+  "id" | "cpf" | "name" | "email" | "createdAt" | "updatedAt"
+>;
 
 export const handler = async (event: SQSEvent): Promise<void> => {
   const processId = generateCorrelationId("order");
@@ -141,19 +88,17 @@ export const handler = async (event: SQSEvent): Promise<void> => {
 
     try {
       const snsMessage = JSON.parse(record.body);
-      const message: OrderData = JSON.parse(snsMessage.Message);
+      const message: MessageData = JSON.parse(snsMessage.Message);
 
       const orderLogger = recordLogger.withContext({
         orderId: message.orderId,
       });
 
       orderLogger.info("Order data parsed successfully", {
-        customerCpf: maskSensitiveData.cpf(message.cpf || ""),
-        customerEmail: maskSensitiveData.email(message.email || ""),
-        customerName: maskSensitiveData.name(message.name || ""),
-        itemsCount: message.items ? message.items.length : 0,
-        orderStatus: message.status,
-        orderTimestamp: message.timestamp,
+        cpf: maskSensitiveData.cpf(message?.customerData?.cpf || ""),
+        email: maskSensitiveData.email(message?.customerData?.email || ""),
+        name: maskSensitiveData.name(message?.customerData?.name || ""),
+        itemsCount: message?.items ? message.items.length : 0,
       });
 
       const processingTracker = new PerformanceTracker(
@@ -182,20 +127,20 @@ export const handler = async (event: SQSEvent): Promise<void> => {
           stockUpdatedItems
         );
 
-        const leadId = await findOrCreateLead(
-          message.email,
-          message.cpf,
-          message.name,
+        const leadData = await findOrCreateLead(
+          message.customerData?.email,
+          message.customerData?.cpf,
+          message.customerData?.name,
           message.orderId,
           orderLogger
         );
 
-        const orderRecord: OrderRecord = {
-          orderId: message.orderId,
-          leadId: leadId,
-          customerCpf: message.cpf,
-          customerEmail: message.email,
-          customerName: message.name,
+        const orderRecord: OrderData = {
+          id: message.orderId,
+          cpf: leadData.cpf,
+          name: leadData.name,
+          leadId: leadData.id,
+          email: leadData.email,
           items: enrichedItems,
           totalItems: enrichedItems.reduce(
             (total: number, item: OrderItem) => total + item.quantity,
@@ -203,7 +148,7 @@ export const handler = async (event: SQSEvent): Promise<void> => {
           ),
           totalValue: totalValue,
           status: OrderStatus.PENDING,
-          source: "order-processing-service",
+          addressData: message.addressData,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         };
@@ -213,13 +158,10 @@ export const handler = async (event: SQSEvent): Promise<void> => {
         if (message.paymentData && message.addressData) {
           await sendTransactionMessage(
             message.orderId,
+            orderRecord.totalValue,
             message.paymentData,
             message.addressData,
-            {
-              name: message.name,
-              email: message.email,
-              cpf: message.cpf,
-            },
+            message.customerData,
             orderLogger
           );
         }
@@ -228,7 +170,7 @@ export const handler = async (event: SQSEvent): Promise<void> => {
           newStatus: orderRecord.status,
           totalItems: orderRecord.totalItems,
           totalValue: orderRecord.totalValue,
-          leadId: leadId,
+          leadId: leadData.id,
           leadAction: "associated",
         });
 
@@ -236,8 +178,7 @@ export const handler = async (event: SQSEvent): Promise<void> => {
           newStatus: orderRecord.status,
           totalItems: orderRecord.totalItems,
           totalValue: orderRecord.totalValue,
-          leadId: leadId,
-          leadRequired: true,
+          leadId: leadData.id,
         });
       } catch (orderError) {
         if (stockUpdatedItems.length > 0) {
@@ -289,14 +230,14 @@ async function findOrCreateLead(
   cpf: string,
   name: string,
   orderReference: string,
-  logger: any
-): Promise<string> {
+  logger: StructuredLogger
+): Promise<LeadData> {
   const leadTracker = new PerformanceTracker(logger, "find-or-create-lead");
 
   try {
     logger.info("Searching for existing lead or creating new one", {
-      customerCpf: maskSensitiveData.cpf(cpf),
-      customerEmail: maskSensitiveData.email(email),
+      cpf: maskSensitiveData.cpf(cpf),
+      email: maskSensitiveData.email(email),
       orderReference: orderReference,
     });
 
@@ -304,43 +245,38 @@ async function findOrCreateLead(
 
     if (existingLead) {
       logger.info("Found existing lead, using existing leadId", {
-        existingLeadId: existingLead.leadId,
-        customerCpf: maskSensitiveData.cpf(cpf),
-        customerEmail: maskSensitiveData.email(email),
+        existingLeadId: existingLead.id,
+        cpf: maskSensitiveData.cpf(cpf),
+        email: maskSensitiveData.email(email),
       });
 
       leadTracker.finish({
         action: "found_existing_lead",
-        leadId: existingLead.leadId,
+        leadId: existingLead.id,
       });
 
-      return existingLead.leadId;
+      return existingLead;
     }
 
     const newLeadId = `lead-${Date.now()}-${Math.random()
       .toString(36)
       .substring(2, 15)}`;
 
-    const newLeadData = {
+    const newLeadData: LeadData = {
       id: newLeadId,
-      leadId: newLeadId,
-      customerCpf: cpf,
-      customerEmail: email,
-      customerName: name,
-      orderReference: orderReference,
-      totalItems: 0,
+      cpf: cpf,
+      name: name,
+      email: email,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      source: "order-processing-service",
-      status: "created_from_order",
     };
 
     await createLeadInDatabase(newLeadData, logger);
 
     logger.info("Created new lead for order", {
       newLeadId: newLeadId,
-      customerCpf: maskSensitiveData.cpf(cpf),
-      customerEmail: maskSensitiveData.email(email),
+      cpf: maskSensitiveData.cpf(cpf),
+      email: maskSensitiveData.email(email),
       orderReference: orderReference,
     });
 
@@ -349,11 +285,11 @@ async function findOrCreateLead(
       leadId: newLeadId,
     });
 
-    return newLeadId;
+    return newLeadData;
   } catch (error) {
     logger.error("Error finding or creating lead", error, {
-      customerCpf: maskSensitiveData.cpf(cpf || ""),
-      customerEmail: maskSensitiveData.email(email || ""),
+      cpf: maskSensitiveData.cpf(cpf || ""),
+      email: maskSensitiveData.email(email || ""),
       orderReference: orderReference,
     });
 
@@ -364,40 +300,38 @@ async function findOrCreateLead(
 async function findExistingLead(
   email: string,
   cpf: string,
-  logger: any
+  logger: StructuredLogger
 ): Promise<ExistingLead | null> {
   const searchTracker = new PerformanceTracker(logger, "lead-search-query");
 
   try {
     logger.info("Searching for existing lead", {
-      customerCpf: maskSensitiveData.cpf(cpf),
-      customerEmail: maskSensitiveData.email(email),
+      cpf: maskSensitiveData.cpf(cpf),
+      email: maskSensitiveData.email(email),
     });
 
     const emailQueryCommand = new QueryCommand({
       TableName: LEAD_TABLE_NAME,
       IndexName: "email-index",
-      KeyConditionExpression: "customerEmail = :email",
+      KeyConditionExpression: "email = :email",
       ExpressionAttributeValues: {
         ":email": email,
       },
       ProjectionExpression:
-        "id, leadId, customerCpf, customerEmail, customerName, createdAt, updatedAt",
+        "id, leadId, cpf, email, name, createdAt, updatedAt",
     });
 
     const emailResult = await docClient.send(emailQueryCommand);
 
     if (emailResult.Items && emailResult.Items.length > 0) {
-      const matchingLead = emailResult.Items.find(
-        (item) => item.customerCpf === cpf
-      );
+      const matchingLead = emailResult.Items.find((item) => item.cpf === cpf);
 
       if (matchingLead) {
         logger.info("Found existing lead with matching email and CPF", {
           existingLeadId: matchingLead.id,
           leadId: matchingLead.leadId,
-          customerCpf: maskSensitiveData.cpf(cpf),
-          customerEmail: maskSensitiveData.email(email),
+          cpf: maskSensitiveData.cpf(cpf),
+          email: maskSensitiveData.email(email),
         });
 
         searchTracker.finish({
@@ -407,10 +341,9 @@ async function findExistingLead(
 
         return {
           id: matchingLead.id as string,
-          leadId: matchingLead.leadId as string,
-          customerCpf: matchingLead.customerCpf as string,
-          customerEmail: matchingLead.customerEmail as string,
-          customerName: matchingLead.customerName as string,
+          cpf: matchingLead.cpf as string,
+          email: matchingLead.email as string,
+          name: matchingLead.name as string,
           createdAt: matchingLead.createdAt as string,
           updatedAt: matchingLead.updatedAt as string,
         };
@@ -418,8 +351,8 @@ async function findExistingLead(
     }
 
     logger.info("No existing lead found for email and CPF combination", {
-      customerCpf: maskSensitiveData.cpf(cpf),
-      customerEmail: maskSensitiveData.email(email),
+      cpf: maskSensitiveData.cpf(cpf),
+      email: maskSensitiveData.email(email),
       emailLeadsCount: emailResult.Items?.length || 0,
     });
 
@@ -431,8 +364,8 @@ async function findExistingLead(
     return null;
   } catch (error) {
     logger.error("Error searching for existing lead", error, {
-      customerCpf: maskSensitiveData.cpf(cpf || ""),
-      customerEmail: maskSensitiveData.email(email || ""),
+      cpf: maskSensitiveData.cpf(cpf || ""),
+      email: maskSensitiveData.email(email || ""),
     });
 
     searchTracker.finishWithError(error);
@@ -440,7 +373,10 @@ async function findExistingLead(
   }
 }
 
-async function createLeadInDatabase(leadData: any, logger: any): Promise<void> {
+async function createLeadInDatabase(
+  leadData: LeadData,
+  logger: StructuredLogger
+): Promise<void> {
   const creationTracker = new PerformanceTracker(
     logger,
     "dynamodb-lead-creation"
@@ -448,9 +384,9 @@ async function createLeadInDatabase(leadData: any, logger: any): Promise<void> {
 
   try {
     logger.info("Creating new lead in DynamoDB", {
-      leadId: leadData.leadId,
-      customerCpf: maskSensitiveData.cpf(leadData.customerCpf),
-      customerEmail: maskSensitiveData.email(leadData.customerEmail),
+      leadId: leadData.id,
+      cpf: maskSensitiveData.cpf(leadData.cpf),
+      email: maskSensitiveData.email(leadData.email),
     });
 
     const putCommand = new PutCommand({
@@ -462,21 +398,20 @@ async function createLeadInDatabase(leadData: any, logger: any): Promise<void> {
     await docClient.send(putCommand);
 
     logger.info("Lead successfully created in DynamoDB", {
-      leadId: leadData.leadId,
-      customerCpf: maskSensitiveData.cpf(leadData.customerCpf),
-      customerEmail: maskSensitiveData.email(leadData.customerEmail),
-      status: leadData.status,
+      leadId: leadData.id,
+      cpf: maskSensitiveData.cpf(leadData.cpf),
+      email: maskSensitiveData.email(leadData.email),
     });
 
     creationTracker.finish({
-      leadId: leadData.leadId,
+      leadId: leadData.id,
       action: "lead_created",
     });
   } catch (error) {
     logger.error("Failed to create lead in DynamoDB", error, {
-      leadId: leadData.leadId,
-      customerCpf: maskSensitiveData.cpf(leadData.customerCpf || ""),
-      customerEmail: maskSensitiveData.email(leadData.customerEmail || ""),
+      leadId: leadData.id,
+      cpf: maskSensitiveData.cpf(leadData.cpf || ""),
+      email: maskSensitiveData.email(leadData.email || ""),
     });
 
     creationTracker.finishWithError(error);
@@ -485,8 +420,8 @@ async function createLeadInDatabase(leadData: any, logger: any): Promise<void> {
 }
 
 async function createOrderInDatabase(
-  orderRecord: OrderRecord,
-  logger: any
+  orderRecord: OrderData,
+  logger: StructuredLogger
 ): Promise<void> {
   const creationTracker = new PerformanceTracker(
     logger,
@@ -495,10 +430,10 @@ async function createOrderInDatabase(
 
   try {
     logger.info("Starting order creation in DynamoDB", {
-      orderId: orderRecord.orderId,
+      orderId: orderRecord.id,
       leadId: orderRecord.leadId,
-      customerCpf: maskSensitiveData.cpf(orderRecord.customerCpf),
-      customerEmail: maskSensitiveData.email(orderRecord.customerEmail),
+      cpf: maskSensitiveData.cpf(orderRecord.cpf),
+      email: maskSensitiveData.email(orderRecord.email),
       totalItems: orderRecord.totalItems,
       totalValue: orderRecord.totalValue,
     });
@@ -512,17 +447,17 @@ async function createOrderInDatabase(
     await docClient.send(putCommand);
 
     logger.info("Order successfully saved to DynamoDB", {
-      orderId: orderRecord.orderId,
+      orderId: orderRecord.id,
       leadId: orderRecord.leadId,
-      customerCpf: maskSensitiveData.cpf(orderRecord.customerCpf),
-      customerEmail: maskSensitiveData.email(orderRecord.customerEmail),
+      cpf: maskSensitiveData.cpf(orderRecord.cpf),
+      email: maskSensitiveData.email(orderRecord.email),
       totalItems: orderRecord.totalItems,
       totalValue: orderRecord.totalValue,
       status: orderRecord.status,
     });
 
     creationTracker.finish({
-      orderId: orderRecord.orderId,
+      orderId: orderRecord.id,
       action: "order_created",
       totalItems: orderRecord.totalItems,
       totalValue: orderRecord.totalValue,
@@ -530,10 +465,10 @@ async function createOrderInDatabase(
     });
   } catch (error) {
     logger.error("Failed to create order in DynamoDB", error, {
-      orderId: orderRecord.orderId,
+      orderId: orderRecord.id,
       leadId: orderRecord.leadId,
-      customerCpf: maskSensitiveData.cpf(orderRecord.customerCpf || ""),
-      customerEmail: maskSensitiveData.email(orderRecord.customerEmail || ""),
+      cpf: maskSensitiveData.cpf(orderRecord.cpf || ""),
+      email: maskSensitiveData.email(orderRecord.email || ""),
     });
 
     creationTracker.finishWithError(error);
@@ -542,8 +477,8 @@ async function createOrderInDatabase(
 }
 
 async function enrichOrderItems(
-  items: OrderItem[],
-  logger: any
+  items: Pick<OrderItem, "id" | "quantity">[],
+  logger: StructuredLogger
 ): Promise<OrderItem[]> {
   const enrichmentTracker = new PerformanceTracker(
     logger,
@@ -644,8 +579,8 @@ async function enrichOrderItems(
 
 async function getProductById(
   productId: string,
-  logger: any
-): Promise<Product | null> {
+  logger: StructuredLogger
+): Promise<Pick<ProductData, "quantityInStock" | "name" | "price"> | null> {
   const productTracker = new PerformanceTracker(logger, "product-lookup");
 
   try {
@@ -656,10 +591,10 @@ async function getProductById(
     const getCommand = new GetCommand({
       TableName: PRODUCT_TABLE_NAME,
       Key: {
-        productId: productId,
+        id: productId,
       },
       ProjectionExpression:
-        "productId, #name, price, category, description, isActive, quantityInStock",
+        "id, #name, price, category, description, isActive, quantityInStock",
       ExpressionAttributeNames: {
         "#name": "name",
       },
@@ -668,11 +603,10 @@ async function getProductById(
     const result = await docClient.send(getCommand);
 
     if (result.Item) {
-      const product: Product = {
-        productId: result.Item.productId as string,
+      const product: ProductData = {
+        id: result.Item.id as string,
         name: result.Item.name as string,
         price: result.Item.price as number,
-        category: result.Item.category as string,
         description: result.Item.description as string,
         isActive: result.Item.isActive as boolean,
         quantityInStock: result.Item.quantityInStock as number | undefined,
@@ -697,7 +631,6 @@ async function getProductById(
         productId: productId,
         productName: product.name,
         price: product.price,
-        category: product.category,
         hasStockControl: product.quantityInStock !== undefined,
         quantityInStock: product.quantityInStock,
       });
@@ -735,8 +668,8 @@ async function getProductById(
 
 async function updateProductsStock(
   items: OrderItem[],
-  logger: any,
-  stockUpdatedItems?: OrderItem[]
+  logger: StructuredLogger,
+  stockUpdatedItems: OrderItem[]
 ): Promise<void> {
   const stockUpdateTracker = new PerformanceTracker(
     logger,
@@ -781,7 +714,7 @@ async function updateProductsStock(
         const updateCommand = new UpdateCommand({
           TableName: PRODUCT_TABLE_NAME,
           Key: {
-            productId: item.id,
+            id: item.id,
           },
           UpdateExpression:
             "SET quantityInStock = quantityInStock - :quantity, updatedAt = :updatedAt",
@@ -797,9 +730,7 @@ async function updateProductsStock(
 
         const result = await docClient.send(updateCommand);
 
-        if (stockUpdatedItems) {
-          stockUpdatedItems.push(item);
-        }
+        stockUpdatedItems.push(item);
 
         logger.info("Stock updated successfully", {
           productId: item.id,
@@ -864,7 +795,7 @@ async function updateProductsStock(
 async function sendStockRollbackMessages(
   stockUpdatedItems: OrderItem[],
   orderId: string,
-  logger: any
+  logger: StructuredLogger
 ): Promise<void> {
   const rollbackTracker = new PerformanceTracker(
     logger,
@@ -953,10 +884,11 @@ async function sendStockRollbackMessages(
 
 async function sendTransactionMessage(
   orderId: string,
-  paymentData: any,
-  addressData: any,
-  customerInfo: { name: string; email: string; cpf: string },
-  logger: any
+  orderTotalValue: number,
+  paymentData: PaymentData,
+  addressData: AddressData,
+  customerData: CustomerData,
+  logger: StructuredLogger
 ): Promise<void> {
   const transactionTracker = new PerformanceTracker(
     logger,
@@ -966,18 +898,18 @@ async function sendTransactionMessage(
   try {
     logger.info("Sending transaction processing message", {
       orderId: orderId,
-      amount: paymentData.amount,
       cardLastFour: paymentData.cardNumber?.slice(-4),
-      customerName: maskSensitiveData.name(customerInfo.name),
+      name: maskSensitiveData.name(customerData.name),
       addressCity: addressData.city,
       addressState: addressData.state,
     });
 
     const transactionMessage: TransactionMessage = {
       orderId: orderId,
+      orderTotalValue,
       paymentData: paymentData,
       addressData: addressData,
-      customerInfo: customerInfo,
+      customerData: customerData,
     };
 
     const sendCommand = new SendMessageCommand({
@@ -990,11 +922,11 @@ async function sendTransactionMessage(
         },
         amount: {
           DataType: "Number",
-          StringValue: paymentData.amount.toString(),
+          StringValue: orderTotalValue.toString(),
         },
-        customerEmail: {
+        email: {
           DataType: "String",
-          StringValue: customerInfo.email,
+          StringValue: customerData.email,
         },
       },
     });
@@ -1003,22 +935,21 @@ async function sendTransactionMessage(
 
     transactionTracker.finish({
       orderId: orderId,
-      amount: paymentData.amount,
+      amount: orderTotalValue,
       queueUrl: PROCESS_TRANSACTION_QUEUE_URL,
     });
 
     logger.info("Transaction processing message sent successfully", {
       orderId: orderId,
-      amount: paymentData.amount,
+      amount: orderTotalValue,
       cardLastFour: paymentData.cardNumber?.slice(-4),
-      customerName: maskSensitiveData.name(customerInfo.name),
+      name: maskSensitiveData.name(customerData.name),
     });
-
   } catch (error) {
     logger.error("Failed to send transaction processing message", error, {
       orderId: orderId,
-      amount: paymentData.amount,
-      customerName: maskSensitiveData.name(customerInfo.name),
+      amount: orderTotalValue,
+      name: maskSensitiveData.name(customerData.name),
     });
 
     transactionTracker.finishWithError(error);
