@@ -4,5 +4,4 @@ export interface ProductData {
   price: number;
   description: string;
   isActive: boolean;
-  quantityInStock?: number;
 }

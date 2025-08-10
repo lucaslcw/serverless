@@ -16,6 +16,7 @@ provider:
     LEAD_COLLECTION_TABLE: !Ref LeadCollectionTable
     ORDER_COLLECTION_TABLE: !Ref OrderCollectionTable
     PRODUCT_COLLECTION_TABLE: !Ref ProductCollectionTable
+    PRODUCT_STOCK_TABLE: !Ref ProductStockTable
     TRANSACTION_COLLECTION_TABLE: !Ref TransactionCollectionTable
   vpc:
     securityGroupIds:
@@ -109,8 +110,14 @@ functions:
       - Effect: Allow
         Action:
           - dynamodb:GetItem
-          - dynamodb:UpdateItem
         Resource: !GetAtt ProductCollectionTable.Arn
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:Query
+        Resource: 
+          - !GetAtt ProductStockTable.Arn
+          - !Sub "${ProductStockTable.Arn}/index/*"
 
   processTransaction:
     handler: lambdas/transaction/process-transaction.handler
@@ -606,6 +613,37 @@ resources:
             Value: ${self:service}-product-collection
           - Key: Description
             Value: Table to store product information with pricing and details
+
+    # DynamoDB Table for Product Stock Collection
+    ProductStockTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: product-stock
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: productId
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: ProductStocksByProductId
+            KeySchema:
+              - AttributeName: productId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Name
+            Value: ${self:service}-product-stock
+          - Key: Description
+            Value: Table to store granular stock movements for products
 
     # DynamoDB Table for Transaction Collection
     TransactionCollectionTable:
