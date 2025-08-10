@@ -10,40 +10,20 @@ import {
   generateCorrelationId,
   PerformanceTracker,
 } from "../../shared/logger";
+import { OrderStatus, OrderData } from "../../shared/schemas/order";
 
-const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const dynamoClient = new DynamoDBClient({ 
+  region: process.env.AWS_REGION || 'us-east-1' 
+});
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 const ORDER_TABLE_NAME = process.env.ORDER_COLLECTION_TABLE!;
 
-enum OrderStatus {
-  PENDING = "PENDING",
-  PROCESSED = "PROCESSED",
-  CANCELLED = "CANCELLED",
-  PAYMENT_APPROVED = "PAYMENT_APPROVED",
-  PAYMENT_DECLINED = "PAYMENT_DECLINED"
-}
-
-interface UpdateOrderMessage {
+export interface UpdateOrderMessage {
   orderId: string;
   status: OrderStatus;
   reason?: string;
   transactionId?: string;
-}
-
-interface OrderRecord {
-  orderId: string;
-  leadId: string;
-  customerCpf: string;
-  customerEmail: string;
-  customerName: string;
-  items: any[];
-  totalItems: number;
-  totalValue: number;
-  status: OrderStatus;
-  source: string;
-  createdAt: string;
-  updatedAt: string;
 }
 
 export const handler = async (event: SQSEvent): Promise<void> => {
@@ -212,7 +192,7 @@ async function updateOrderRecord(
 async function getOrderById(
   orderId: string,
   logger: any
-): Promise<OrderRecord | null> {
+): Promise<OrderData | null> {
   const orderTracker = new PerformanceTracker(
     logger,
     "order-lookup"
@@ -233,7 +213,7 @@ async function getOrderById(
     const result = await docClient.send(getCommand);
 
     if (result.Item) {
-      const order: OrderRecord = result.Item as OrderRecord;
+      const order: OrderData = result.Item as OrderData;
 
       logger.info("Order found for update", {
         orderId: orderId,
@@ -355,19 +335,8 @@ function isValidStatusTransition(
     [OrderStatus.PENDING]: [
       OrderStatus.PROCESSED,
       OrderStatus.CANCELLED,
-      OrderStatus.PAYMENT_APPROVED,
-      OrderStatus.PAYMENT_DECLINED,
     ],
-    [OrderStatus.PAYMENT_APPROVED]: [
-      OrderStatus.PROCESSED,
-      OrderStatus.CANCELLED,
-    ],
-    [OrderStatus.PAYMENT_DECLINED]: [
-      OrderStatus.CANCELLED,
-    ],
-    [OrderStatus.PROCESSED]: [
-      OrderStatus.CANCELLED,
-    ],
+    [OrderStatus.PROCESSED]: [],
     [OrderStatus.CANCELLED]: [],
   };
 
