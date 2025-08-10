@@ -30,17 +30,6 @@ const ORDER_TABLE_NAME = process.env.ORDER_COLLECTION_TABLE!;
 const TRANSACTION_TABLE_NAME = process.env.TRANSACTION_COLLECTION_TABLE!;
 const UPDATE_ORDER_QUEUE_URL = process.env.UPDATE_ORDER_QUEUE_URL!;
 
-const PAYMENT_LIMITS = {
-  HIGH_VALUE_THRESHOLD: 10000,
-  MEDIUM_VALUE_THRESHOLD: 1000,
-} as const;
-
-const APPROVAL_RATES = {
-  HIGH_VALUE: 0.75,   // 75% approval rate for high-value transactions
-  MEDIUM_VALUE: 0.85, // 85% approval rate for medium-value transactions  
-  LOW_VALUE: 0.95,    // 95% approval rate for low-value transactions
-} as const;
-
 const GATEWAY_CONFIG = {
   BASE_DELAY_MS: 200,
   MAX_ADDITIONAL_DELAY_MS: 500,
@@ -54,8 +43,6 @@ export interface TransactionMessage {
   addressData: AddressData;
   customerData: CustomerData;
 }
-
-type TransactionValueCategory = 'HIGH' | 'MEDIUM' | 'LOW';
 
 interface PaymentResult {
   status: PaymentStatus;
@@ -80,16 +67,6 @@ function validateTransactionMessage(message: any): TransactionMessage {
   }
 
   return message as TransactionMessage;
-}
-
-function getTransactionValueCategory(totalValue: number): TransactionValueCategory {
-  if (totalValue >= PAYMENT_LIMITS.HIGH_VALUE_THRESHOLD) {
-    return 'HIGH';
-  }
-  if (totalValue >= PAYMENT_LIMITS.MEDIUM_VALUE_THRESHOLD) {
-    return 'MEDIUM';
-  }
-  return 'LOW';
 }
 
 function generateTransactionId(): string {
@@ -167,7 +144,6 @@ async function processTransaction(
   transactionLogger.info("Starting transaction processing", {
     orderId: message.orderId,
     amount: message.orderTotalValue,
-    valueCategory: getTransactionValueCategory(message.orderTotalValue),
     cardLastFour: message.paymentData.cardNumber.slice(-4),
     customerName: maskSensitiveData.name(message.customerData.name),
     addressCity: message.addressData.city,
@@ -283,7 +259,6 @@ async function processPayment(
 
   logger.info("Processing payment with gateway", {
     amount: totalValue,
-    valueCategory: getTransactionValueCategory(totalValue),
     cardLastFour: paymentData.cardNumber.slice(-4),
     cardHolderName: maskSensitiveData.name(paymentData.cardHolderName),
   });
@@ -291,7 +266,7 @@ async function processPayment(
   try {
     await simulatePaymentGatewayCall();
 
-    const isApproved = simulatePaymentApproval(paymentData, totalValue);
+    const isApproved = simulatePaymentApproval(paymentData);
     const processingTime = Date.now() - startTime;
 
     const result: PaymentResult = {
@@ -351,27 +326,11 @@ async function simulatePaymentGatewayCall(): Promise<void> {
   }
 }
 
-function simulatePaymentApproval(paymentData: PaymentData, totalValue: number): boolean {
+function simulatePaymentApproval(paymentData: PaymentData): boolean {
   if (paymentData.cardNumber.endsWith("0000")) {
     return false;
   }
-
-  const valueCategory = getTransactionValueCategory(totalValue);
-  let approvalRate: number;
-  
-  switch (valueCategory) {
-    case 'HIGH':
-      approvalRate = APPROVAL_RATES.HIGH_VALUE;
-      break;
-    case 'MEDIUM':
-      approvalRate = APPROVAL_RATES.MEDIUM_VALUE;
-      break;
-    case 'LOW':
-      approvalRate = APPROVAL_RATES.LOW_VALUE;
-      break;
-  }
-
-  return Math.random() < approvalRate;
+  return true;
 }
 
 async function getOrderById(orderId: string, logger: StructuredLogger): Promise<OrderData | null> {
