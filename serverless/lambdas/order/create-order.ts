@@ -506,19 +506,24 @@ async function enrichOrderItems(
       const product = await getProductById(item.id, logger);
 
       if (product) {
-        const currentStock = await calculateCurrentStock(item.id);
+        const productHasStockControl = product.hasStockControl ?? false;
 
-        if (currentStock < item.quantity) {
-          logger.error("Insufficient stock for product", {
-            productId: item.id,
-            productName: product.name,
-            requestedQuantity: item.quantity,
-            availableStock: currentStock,
-          });
+        let currentStock = 0;
+        if (productHasStockControl) {
+          currentStock = await calculateCurrentStock(item.id);
+          
+          if (currentStock < item.quantity) {
+            logger.error("Insufficient stock for product", {
+              productId: item.id,
+              productName: product.name,
+              requestedQuantity: item.quantity,
+              availableStock: currentStock,
+            });
 
-          throw new Error(
-            `Insufficient stock for product ${product.name}. Requested: ${item.quantity}, Available: ${currentStock}`
-          );
+            throw new Error(
+              `Insufficient stock for product ${product.name}. Requested: ${item.quantity}, Available: ${currentStock}`
+            );
+          }
         }
 
         const enrichedItem: OrderItem = {
@@ -527,7 +532,7 @@ async function enrichOrderItems(
           productName: product.name,
           unitPrice: product.price,
           totalPrice: product.price * item.quantity,
-          hasStockControl: true,
+          hasStockControl: productHasStockControl,
         };
 
         enrichedItems.push(enrichedItem);
@@ -538,7 +543,8 @@ async function enrichOrderItems(
           quantity: item.quantity,
           unitPrice: product.price,
           totalPrice: enrichedItem.totalPrice,
-          hasStockControl: true,
+          hasStockControl: productHasStockControl,
+          currentStock: productHasStockControl ? currentStock : 'N/A',
         });
       } else {
         logger.warn("Product not found, using basic item data", {
@@ -588,7 +594,7 @@ async function enrichOrderItems(
 async function getProductById(
   productId: string,
   logger: StructuredLogger
-): Promise<Pick<ProductData, "name" | "price"> | null> {
+): Promise<Pick<ProductData, "name" | "price" | "hasStockControl"> | null> {
   const productTracker = new PerformanceTracker(logger, "product-lookup");
 
   try {
@@ -602,7 +608,7 @@ async function getProductById(
         id: productId,
       },
       ProjectionExpression:
-        "id, #name, price, category, description, isActive",
+        "id, #name, price, category, description, isActive, hasStockControl",
       ExpressionAttributeNames: {
         "#name": "name",
       },
@@ -617,6 +623,7 @@ async function getProductById(
         price: result.Item.price as number,
         description: result.Item.description as string,
         isActive: result.Item.isActive as boolean,
+        hasStockControl: result.Item.hasStockControl as boolean,
       };
 
       if (!product.isActive) {

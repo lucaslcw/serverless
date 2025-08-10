@@ -215,7 +215,6 @@ describe('Validators', () => {
           name: 'João Silva'
         },
         items: [{ id: 'item1', quantity: 2 }],
-        // missing paymentData and addressData
       };
       const result = validateInitializeOrderData(data as any);
       expect(result.isValid).toBe(false);
