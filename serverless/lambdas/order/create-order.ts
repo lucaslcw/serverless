@@ -6,7 +6,6 @@ import {
   QueryCommand,
   PutCommand,
   GetCommand,
-  UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import {
   createLogger,
@@ -27,7 +26,8 @@ import {
 import { TransactionMessage } from "../transaction/process-transaction";
 import { LeadData } from "../../shared/schemas/lead";
 import { ProductData } from "../../shared/schemas/product";
-import { StockOperationType, StockUpdateMessage } from "../product/update-product-stock";
+import { StockOperationType, ProductStockData } from "../../shared/schemas/product-stock";
+import { StockUpdateMessage } from "../product/update-product-stock";
 
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
 const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
@@ -36,9 +36,41 @@ const docClient = DynamoDBDocumentClient.from(dynamoClient);
 const LEAD_TABLE_NAME = process.env.LEAD_COLLECTION_TABLE!;
 const ORDER_TABLE_NAME = process.env.ORDER_COLLECTION_TABLE!;
 const PRODUCT_TABLE_NAME = process.env.PRODUCT_COLLECTION_TABLE!;
+const PRODUCT_STOCK_TABLE_NAME = "product-stock";
 const PRODUCT_STOCK_QUEUE_URL = process.env.PRODUCT_STOCK_QUEUE_URL!;
 const PROCESS_TRANSACTION_QUEUE_URL =
   process.env.PROCESS_TRANSACTION_QUEUE_URL!;
+
+async function calculateCurrentStock(productId: string): Promise<number> {
+  const queryParams = {
+    TableName: PRODUCT_STOCK_TABLE_NAME,
+    IndexName: "ProductStocksByProductId",
+    KeyConditionExpression: "productId = :productId",
+    ExpressionAttributeValues: {
+      ":productId": productId,
+    },
+  };
+
+  const result = await docClient.send(new QueryCommand(queryParams));
+  
+  if (!result.Items || result.Items.length === 0) {
+    return 0;
+  }
+
+  let totalIncrease = 0;
+  let totalDecrease = 0;
+
+  for (const item of result.Items) {
+    const entry = item as ProductStockData;
+    if (entry.type === StockOperationType.INCREASE) {
+      totalIncrease += entry.quantity;
+    } else if (entry.type === StockOperationType.DECREASE) {
+      totalDecrease += entry.quantity;
+    }
+  }
+
+  return totalIncrease - totalDecrease;
+}
 
 type ExistingLead = Pick<
   LeadData,
@@ -106,13 +138,11 @@ export const handler = async (event: SQSEvent): Promise<void> => {
         0
       );
 
-      const stockUpdatedItems: OrderItem[] = [];
-
       try {
-        await updateProductsStock(
+        await sendStockUpdateMessages(
           enrichedItems,
-          orderLogger,
-          stockUpdatedItems
+          message.orderId,
+          orderLogger
         );
 
         const leadData = await findOrCreateLead(
@@ -169,21 +199,12 @@ export const handler = async (event: SQSEvent): Promise<void> => {
           leadId: leadData.id,
         });
       } catch (orderError) {
-        if (stockUpdatedItems.length > 0) {
-          orderLogger.warn(
-            "Order creation failed, sending stock rollback messages",
-            {
-              stockUpdatedItemsCount: stockUpdatedItems.length,
-              orderId: message.orderId,
-            }
-          );
-
-          await sendStockRollbackMessages(
-            stockUpdatedItems,
-            message.orderId,
-            orderLogger
-          );
-        }
+        orderLogger.warn(
+          "Order creation failed, stock messages may need to be handled by retry logic",
+          {
+            orderId: message.orderId,
+          }
+        );
 
         throw orderError;
       }
@@ -485,19 +506,19 @@ async function enrichOrderItems(
       const product = await getProductById(item.id, logger);
 
       if (product) {
-        if (product.quantityInStock !== undefined) {
-          if (product.quantityInStock < item.quantity) {
-            logger.error("Insufficient stock for product", {
-              productId: item.id,
-              productName: product.name,
-              requestedQuantity: item.quantity,
-              availableStock: product.quantityInStock,
-            });
+        const currentStock = await calculateCurrentStock(item.id);
 
-            throw new Error(
-              `Insufficient stock for product ${product.name}. Requested: ${item.quantity}, Available: ${product.quantityInStock}`
-            );
-          }
+        if (currentStock < item.quantity) {
+          logger.error("Insufficient stock for product", {
+            productId: item.id,
+            productName: product.name,
+            requestedQuantity: item.quantity,
+            availableStock: currentStock,
+          });
+
+          throw new Error(
+            `Insufficient stock for product ${product.name}. Requested: ${item.quantity}, Available: ${currentStock}`
+          );
         }
 
         const enrichedItem: OrderItem = {
@@ -506,7 +527,7 @@ async function enrichOrderItems(
           productName: product.name,
           unitPrice: product.price,
           totalPrice: product.price * item.quantity,
-          hasStockControl: product.quantityInStock !== undefined,
+          hasStockControl: true,
         };
 
         enrichedItems.push(enrichedItem);
@@ -517,8 +538,7 @@ async function enrichOrderItems(
           quantity: item.quantity,
           unitPrice: product.price,
           totalPrice: enrichedItem.totalPrice,
-          hasStockControl: product.quantityInStock !== undefined,
-          availableStock: product.quantityInStock,
+          hasStockControl: true,
         });
       } else {
         logger.warn("Product not found, using basic item data", {
@@ -568,7 +588,7 @@ async function enrichOrderItems(
 async function getProductById(
   productId: string,
   logger: StructuredLogger
-): Promise<Pick<ProductData, "quantityInStock" | "name" | "price"> | null> {
+): Promise<Pick<ProductData, "name" | "price"> | null> {
   const productTracker = new PerformanceTracker(logger, "product-lookup");
 
   try {
@@ -582,7 +602,7 @@ async function getProductById(
         id: productId,
       },
       ProjectionExpression:
-        "id, #name, price, category, description, isActive, quantityInStock",
+        "id, #name, price, category, description, isActive",
       ExpressionAttributeNames: {
         "#name": "name",
       },
@@ -597,7 +617,6 @@ async function getProductById(
         price: result.Item.price as number,
         description: result.Item.description as string,
         isActive: result.Item.isActive as boolean,
-        quantityInStock: result.Item.quantityInStock as number | undefined,
       };
 
       if (!product.isActive) {
@@ -619,8 +638,6 @@ async function getProductById(
         productId: productId,
         productName: product.name,
         price: product.price,
-        hasStockControl: product.quantityInStock !== undefined,
-        quantityInStock: product.quantityInStock,
       });
 
       productTracker.finish({
@@ -628,7 +645,6 @@ async function getProductById(
         found: true,
         active: true,
         price: product.price,
-        hasStockControl: product.quantityInStock !== undefined,
       });
 
       return product;
@@ -654,14 +670,14 @@ async function getProductById(
   }
 }
 
-async function updateProductsStock(
+async function sendStockUpdateMessages(
   items: OrderItem[],
-  logger: StructuredLogger,
-  stockUpdatedItems: OrderItem[]
+  orderId: string,
+  logger: StructuredLogger
 ): Promise<void> {
   const stockUpdateTracker = new PerformanceTracker(
     logger,
-    "products-stock-update"
+    "stock-update-messages"
   );
 
   try {
@@ -669,7 +685,7 @@ async function updateProductsStock(
       (item) => item.hasStockControl && item.quantity > 0
     );
 
-    logger.info("Starting products stock update", {
+    logger.info("Sending stock update messages", {
       totalItemsCount: items.length,
       itemsWithStockControlCount: itemsWithStockControl.length,
       itemsWithStockControl: itemsWithStockControl.map((item) => ({
@@ -684,133 +700,29 @@ async function updateProductsStock(
         "No products with stock control found, skipping stock update"
       );
       stockUpdateTracker.finish({
-        updatedProducts: 0,
-        totalQuantitySubtracted: 0,
+        sentMessages: 0,
+        totalQuantityReserved: 0,
         skippedReason: "no_stock_control",
       });
       return;
     }
 
-    const updatePromises = itemsWithStockControl.map(async (item) => {
-      try {
-        logger.info("Updating stock for product", {
-          productId: item.id,
-          productName: item.productName,
-          quantityToSubtract: item.quantity,
-        });
-
-        const updateCommand = new UpdateCommand({
-          TableName: PRODUCT_TABLE_NAME,
-          Key: {
-            id: item.id,
-          },
-          UpdateExpression:
-            "SET quantityInStock = quantityInStock - :quantity, updatedAt = :updatedAt",
-          ConditionExpression:
-            "quantityInStock >= :quantity AND isActive = :isActive",
-          ExpressionAttributeValues: {
-            ":quantity": item.quantity,
-            ":isActive": true,
-            ":updatedAt": new Date().toISOString(),
-          },
-          ReturnValues: "ALL_NEW",
-        });
-
-        const result = await docClient.send(updateCommand);
-
-        stockUpdatedItems.push(item);
-
-        logger.info("Stock updated successfully", {
-          productId: item.id,
-          productName: item.productName,
-          previousStock:
-            (result.Attributes?.quantityInStock as number) + item.quantity,
-          newStock: result.Attributes?.quantityInStock as number,
-          quantitySubtracted: item.quantity,
-        });
-      } catch (error: any) {
-        logger.error("Failed to update stock for product", error, {
-          productId: item.id,
-          productName: item.productName,
-          quantityToSubtract: item.quantity,
-          errorCode: error.name,
-        });
-
-        if (error.name === "ConditionalCheckFailedException") {
-          throw new Error(
-            `Stock update failed for product ${item.productName}. Insufficient stock or product is inactive.`
-          );
-        }
-
-        throw error;
-      }
-    });
-
-    await Promise.all(updatePromises);
-
-    stockUpdateTracker.finish({
-      updatedProducts: itemsWithStockControl.length,
-      totalQuantitySubtracted: itemsWithStockControl.reduce(
-        (total, item) => total + item.quantity,
-        0
-      ),
-    });
-
-    logger.info("All products stock updated successfully", {
-      totalItemsCount: items.length,
-      updatedProductsCount: itemsWithStockControl.length,
-      totalQuantitySubtracted: itemsWithStockControl.reduce(
-        (total, item) => total + item.quantity,
-        0
-      ),
-    });
-  } catch (error) {
-    logger.error("Error updating products stock", error, {
-      itemsCount: items.length,
-      items: items.map((item) => ({
-        productId: item.id,
-        quantity: item.quantity,
-        productName: item.productName,
-      })),
-    });
-
-    stockUpdateTracker.finishWithError(error);
-
-    throw error;
-  }
-}
-
-async function sendStockRollbackMessages(
-  stockUpdatedItems: OrderItem[],
-  orderId: string,
-  logger: StructuredLogger
-): Promise<void> {
-  const rollbackTracker = new PerformanceTracker(
-    logger,
-    "stock-rollback-messages"
-  );
-
-  try {
-    logger.info("Sending stock rollback messages", {
-      itemsCount: stockUpdatedItems.length,
-      orderId: orderId,
-      items: stockUpdatedItems.map((item) => ({
-        productId: item.id,
-        quantity: item.quantity,
-        productName: item.productName,
-      })),
-    });
-
-    const sendPromises = stockUpdatedItems.map(async (item) => {
+    const sendPromises = itemsWithStockControl.map(async (item) => {
       const stockMessage: StockUpdateMessage = {
         productId: item.id,
         quantity: item.quantity,
-        operation: StockOperationType.INCREASE,
+        operation: StockOperationType.DECREASE,
         orderId: orderId,
-        reason: "Order creation failed - rolling back stock reduction",
+        reason: "Order sale",
       };
 
       try {
+        logger.info("Sending stock decrease message", {
+          productId: item.id,
+          productName: item.productName,
+          quantityToDecrease: item.quantity,
+        });
+
         const sendCommand = new SendMessageCommand({
           QueueUrl: PRODUCT_STOCK_QUEUE_URL,
           MessageBody: JSON.stringify(stockMessage),
@@ -832,7 +744,7 @@ async function sendStockRollbackMessages(
 
         await sqsClient.send(sendCommand);
 
-        logger.info("Stock rollback message sent successfully", {
+        logger.info("Stock decrease message sent successfully", {
           productId: item.id,
           productName: item.productName,
           quantity: item.quantity,
@@ -840,33 +752,47 @@ async function sendStockRollbackMessages(
           orderId: orderId,
         });
       } catch (error) {
-        logger.error("Failed to send stock rollback message", error, {
+        logger.error("Failed to send stock decrease message", error, {
           productId: item.id,
           productName: item.productName,
           quantity: item.quantity,
           orderId: orderId,
         });
+        throw error;
       }
     });
 
     await Promise.all(sendPromises);
 
-    rollbackTracker.finish({
-      rollbackMessagesCount: stockUpdatedItems.length,
-      orderId: orderId,
+    stockUpdateTracker.finish({
+      sentMessages: itemsWithStockControl.length,
+      totalQuantityReserved: itemsWithStockControl.reduce(
+        (total, item) => total + item.quantity,
+        0
+      ),
     });
 
-    logger.info("All stock rollback messages sent", {
-      totalMessages: stockUpdatedItems.length,
-      orderId: orderId,
+    logger.info("All stock update messages sent successfully", {
+      totalItemsCount: items.length,
+      sentMessagesCount: itemsWithStockControl.length,
+      totalQuantityReserved: itemsWithStockControl.reduce(
+        (total, item) => total + item.quantity,
+        0
+      ),
     });
   } catch (error) {
-    logger.error("Error sending stock rollback messages", error, {
-      itemsCount: stockUpdatedItems.length,
+    logger.error("Error sending stock update messages", error, {
+      itemsCount: items.length,
       orderId: orderId,
+      items: items.map((item) => ({
+        productId: item.id,
+        quantity: item.quantity,
+        productName: item.productName,
+      })),
     });
 
-    rollbackTracker.finishWithError(error);
+    stockUpdateTracker.finishWithError(error);
+    throw error;
   }
 }
 
