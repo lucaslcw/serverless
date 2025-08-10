@@ -7,14 +7,14 @@ jest.mock("aws-sdk", () => ({
   })),
 }));
 
-jest.mock("../shared/validators", () => ({
+jest.mock("../../shared/validators", () => ({
   validateInitializeOrderData: jest.fn(),
   sanitizeInitializeOrderData: jest.fn(),
   createErrorResponse: jest.fn(),
   createSuccessResponse: jest.fn(),
 }));
 
-jest.mock("../shared/logger", () => ({
+jest.mock("../../shared/logger", () => ({
   createLogger: jest.fn(),
   generateCorrelationId: jest.fn(),
   maskSensitiveData: {
@@ -25,20 +25,20 @@ jest.mock("../shared/logger", () => ({
   PerformanceTracker: jest.fn(),
 }));
 
-import { handler } from "../lambdas/order/initialize-order";
+import { handler } from "../order/initialize-order";
 import {
   validateInitializeOrderData,
   sanitizeInitializeOrderData,
   createErrorResponse,
   createSuccessResponse,
-} from "../shared/validators";
+} from "../../shared/validators";
 
 import {
   createLogger,
   generateCorrelationId,
   maskSensitiveData,
   PerformanceTracker,
-} from "../shared/logger";
+} from "../../shared/logger";
 
 describe("initialize-order handler", () => {
   let mockEvent: Partial<APIGatewayProxyEvent>;

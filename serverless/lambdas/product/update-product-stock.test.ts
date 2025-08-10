@@ -1,11 +1,11 @@
 import { SQSEvent, SQSRecord } from "aws-lambda";
-import { handler } from "../lambdas/product/update-product-stock";
+import { handler } from "../product/update-product-stock";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import {
   createLogger,
   generateCorrelationId,
   PerformanceTracker,
-} from "../shared/logger";
+} from "../../shared/logger";
 
 jest.mock("@aws-sdk/client-dynamodb");
 jest.mock("@aws-sdk/lib-dynamodb", () => {
@@ -31,7 +31,7 @@ jest.mock("@aws-sdk/lib-dynamodb", () => {
   };
 });
 
-jest.mock("../shared/logger", () => ({
+jest.mock("../../shared/logger", () => ({
   createLogger: jest.fn(),
   generateCorrelationId: jest.fn(),
   PerformanceTracker: jest.fn(),

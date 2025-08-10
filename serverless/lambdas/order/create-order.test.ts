@@ -1,5 +1,5 @@
 import { SQSEvent, SQSRecord } from "aws-lambda";
-import { handler } from "../lambdas/order/create-order";
+import { handler } from "../order/create-order";
 
 jest.mock("@aws-sdk/client-dynamodb");
 jest.mock("@aws-sdk/lib-dynamodb", () => {
@@ -42,7 +42,7 @@ jest.mock("@aws-sdk/client-sqs", () => {
   };
 });
 
-jest.mock("../shared/logger", () => ({
+jest.mock("../../shared/logger", () => ({
   createLogger: jest.fn(),
   generateCorrelationId: jest.fn(),
   maskSensitiveData: {
@@ -58,11 +58,11 @@ import {
   generateCorrelationId,
   maskSensitiveData,
   PerformanceTracker,
-} from "../shared/logger";
+} from "../../shared/logger";
 
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { SQSClient } from "@aws-sdk/client-sqs";
-import { MessageData } from "../lambdas/order/initialize-order";
+import { MessageData } from "../order/initialize-order";
 
 describe("create-order handler", () => {
   let mockEvent: SQSEvent;

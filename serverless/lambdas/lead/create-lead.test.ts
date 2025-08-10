@@ -1,5 +1,5 @@
 import { SQSEvent, SQSRecord } from "aws-lambda";
-import { MessageData } from "../lambdas/order/initialize-order";
+import { MessageData } from "../order/initialize-order";
 
 const mockSend = jest.fn();
 
@@ -17,7 +17,7 @@ jest.mock("@aws-sdk/lib-dynamodb", () => ({
   PutCommand: jest.fn().mockImplementation((params) => params),
 }));
 
-import { handler } from "../lambdas/lead/create-lead";
+import { handler } from "../lead/create-lead";
 
 process.env.LEAD_COLLECTION_TABLE = "lead-collection-test";
 

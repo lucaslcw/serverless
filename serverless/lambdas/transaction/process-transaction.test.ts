@@ -1,5 +1,5 @@
 import { SQSEvent, SQSRecord } from "aws-lambda";
-import { handler, TransactionMessage } from "../lambdas/transaction/process-transaction";
+import { handler, TransactionMessage } from "./process-transaction";
 
 jest.mock("@aws-sdk/client-dynamodb");
 jest.mock("@aws-sdk/lib-dynamodb", () => {
@@ -34,7 +34,7 @@ jest.mock("@aws-sdk/client-sqs", () => {
   };
 });
 
-jest.mock("../shared/logger", () => ({
+jest.mock("../../shared/logger", () => ({
   createLogger: jest.fn(),
   generateCorrelationId: jest.fn(),
   maskSensitiveData: {
@@ -50,12 +50,12 @@ import {
   generateCorrelationId,
   maskSensitiveData,
   PerformanceTracker,
-} from "../shared/logger";
+} from "../../shared/logger";
 
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { SQSClient } from "@aws-sdk/client-sqs";
-import { OrderStatus } from "../shared/schemas/order";
-import { PaymentStatus } from "../shared/schemas/transaction";
+import { OrderStatus } from "../../shared/schemas/order";
+import { PaymentStatus } from "../../shared/schemas/transaction";
 
 describe("process-transaction handler", () => {
   let mockEvent: SQSEvent;

@@ -5,7 +5,6 @@ import {
   PerformanceTracker,
   withPerformanceLogging,
   LogContext,
-  LogMetadata,
 } from "../shared/logger";
 
 const mockConsoleLog = jest.spyOn(console, "log").mockImplementation();
