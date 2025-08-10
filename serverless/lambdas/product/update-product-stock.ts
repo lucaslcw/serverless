@@ -9,34 +9,55 @@ import {
   createLogger,
   generateCorrelationId,
   PerformanceTracker,
+  StructuredLogger,
 } from "../../shared/logger";
+import { ProductData } from "../../shared/schemas/product";
 
-const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const dynamoClient = new DynamoDBClient({ 
+  region: process.env.AWS_REGION || 'us-east-1' 
+});
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 const PRODUCT_TABLE_NAME = process.env.PRODUCT_COLLECTION_TABLE!;
 
-enum StockOperationType {
+export enum StockOperationType {
   DECREASE = "DECREASE",
   INCREASE = "INCREASE",
 }
 
-interface StockUpdateMessage {
+export interface StockUpdateMessage {
   productId: string;
   quantity: number;
   operation: StockOperationType;
-  orderId?: string;
-  reason?: string;
+  orderId: string;
+  reason: string;
 }
 
-interface Product {
+interface StockUpdateResult {
   productId: string;
-  name: string;
-  price: number;
-  category: string;
-  description?: string;
-  isActive: boolean;
-  quantityInStock?: number;
+  previousStock: number;
+  newStock: number;
+  operation: StockOperationType;
+  quantity: number;
+}
+
+function validateStockUpdateMessage(message: any): StockUpdateMessage {
+  const requiredFields = ['productId', 'quantity', 'operation', 'orderId', 'reason'];
+  const missingFields = requiredFields.filter(field => !message[field]);
+  
+  if (missingFields.length > 0) {
+    throw new Error(`Missing required fields: ${missingFields.join(', ')}`);
+  }
+
+  if (!Object.values(StockOperationType).includes(message.operation)) {
+    throw new Error(`Invalid operation type: ${message.operation}. Must be DECREASE or INCREASE`);
+  }
+
+  if (typeof message.quantity !== 'number' || message.quantity <= 0) {
+    throw new Error(`Invalid quantity: ${message.quantity}. Must be a positive number`);
+  }
+
+  return message as StockUpdateMessage;
 }
 
 export const handler = async (event: SQSEvent): Promise<void> => {
@@ -46,15 +67,16 @@ export const handler = async (event: SQSEvent): Promise<void> => {
     functionName: "update-product-stock",
   });
 
-  const mainTracker = new PerformanceTracker(logger, "stock-update-batch");
+  const batchTracker = new PerformanceTracker(logger, "stock-update-batch");
 
   logger.info("Processing stock update batch started", {
     recordsCount: event.Records.length,
   });
 
-  for (const [index, record] of event.Records.entries()) {
+  for (let i = 0; i < event.Records.length; i++) {
+    const record = event.Records[i];
     const recordLogger = logger.withContext({
-      recordIndex: index,
+      recordIndex: i,
       messageId: record.messageId,
     });
 
@@ -63,66 +85,43 @@ export const handler = async (event: SQSEvent): Promise<void> => {
       "stock-update-record"
     );
 
-    recordLogger.info("Processing SQS record", {
-      receiptHandle: record.receiptHandle.substring(0, 50) + "...",
-      body: record.body.substring(0, 200) + "...",
-    });
-
     try {
-      const message: StockUpdateMessage = JSON.parse(record.body);
-
-      const stockLogger = recordLogger.withContext({
-        productId: message.productId,
-        operation: message.operation,
-        quantity: message.quantity,
+      recordLogger.info("Processing stock update record", {
+        receiptHandle: record.receiptHandle?.substring(0, 30) + "...",
+        bodyPreview: record.body.substring(0, 100) + "...",
       });
 
-      stockLogger.info("Stock update message parsed successfully", {
-        productId: message.productId,
-        operation: message.operation,
-        quantity: message.quantity,
-        orderId: message.orderId,
-        reason: message.reason,
-      });
+      const rawMessage = JSON.parse(record.body);
+      const stockUpdateMessage = validateStockUpdateMessage(rawMessage);
 
-      const processingTracker = new PerformanceTracker(
-        stockLogger,
-        "stock-update-logic"
-      );
-
-      stockLogger.info("Starting stock update logic");
-
-      await updateProductStock(message, stockLogger);
-
-      processingTracker.finish({
-        productId: message.productId,
-        operation: message.operation,
-        quantity: message.quantity,
-      });
-
-      stockLogger.info("Stock update completed successfully", {
-        productId: message.productId,
-        operation: message.operation,
-        quantity: message.quantity,
-        orderId: message.orderId,
-      });
+      const result = await processStockUpdate(stockUpdateMessage, recordLogger);
 
       recordTracker.finish({
-        productId: message.productId,
+        productId: stockUpdateMessage.productId,
+        operation: stockUpdateMessage.operation,
+        quantity: stockUpdateMessage.quantity,
         status: "success",
       });
-    } catch (error) {
+
+      recordLogger.info("Stock update record processed successfully", {
+        productId: result.productId,
+        operation: result.operation,
+        previousStock: result.previousStock,
+        newStock: result.newStock,
+      });
+
+    } catch (error: any) {
       recordLogger.error("Error processing stock update record", error, {
         sqsMessagePreview: record.body.substring(0, 200),
+        errorType: error.constructor.name,
+        recordIndex: i,
       });
 
       recordTracker.finishWithError(error);
-
-      throw error;
     }
   }
 
-  mainTracker.finish({
+  batchTracker.finish({
     totalRecords: event.Records.length,
     status: "completed",
   });
@@ -132,98 +131,124 @@ export const handler = async (event: SQSEvent): Promise<void> => {
   });
 };
 
-async function updateProductStock(
+async function processStockUpdate(
   message: StockUpdateMessage,
-  logger: any
-): Promise<void> {
-  const updateTracker = new PerformanceTracker(logger, "product-stock-update");
+  logger: StructuredLogger
+): Promise<StockUpdateResult> {
+  const updateLogger = logger.withContext({
+    productId: message.productId,
+    operation: message.operation,
+    quantity: message.quantity,
+    orderId: message.orderId,
+  });
+
+  const processingTracker = new PerformanceTracker(updateLogger, "stock-update-processing");
+
+  updateLogger.info("Starting stock update processing", {
+    productId: message.productId,
+    operation: message.operation,
+    quantity: message.quantity,
+    orderId: message.orderId,
+    reason: message.reason,
+  });
 
   try {
-    logger.info("Starting product stock update", {
+    const product = await getProductById(message.productId, updateLogger);
+    
+    validateProductForStockUpdate(product, message, updateLogger);
+    
+    const result = await executeStockUpdate(product!, message, updateLogger);
+
+    processingTracker.finish({
       productId: message.productId,
       operation: message.operation,
       quantity: message.quantity,
+      previousStock: result.previousStock,
+      newStock: result.newStock,
     });
 
-    const product = await getProductById(message.productId, logger);
+    updateLogger.info("Stock update processing completed successfully", {
+      productId: result.productId,
+      operation: result.operation,
+      previousStock: result.previousStock,
+      newStock: result.newStock,
+      quantityChanged: result.quantity,
+    });
 
-    if (!product) {
-      const error = new Error(`Product not found: ${message.productId}`);
-      logger.error("Product not found for stock update", error, {
-        productId: message.productId,
-      });
-      throw error;
-    }
+    return result;
 
-    if (!product.isActive) {
-      const error = new Error(`Product is inactive: ${message.productId}`);
-      logger.error("Cannot update stock for inactive product", error, {
-        productId: message.productId,
-        productName: product.name,
-      });
-      throw error;
-    }
+  } catch (error: any) {
+    updateLogger.error("Stock update processing failed", error, {
+      productId: message.productId,
+      operation: message.operation,
+      quantity: message.quantity,
+      orderId: message.orderId,
+    });
 
-    if (product.quantityInStock === undefined) {
-      const error = new Error(
-        `Product ${product.name} does not have stock control (quantityInStock property missing)`
-      );
-      logger.error("Product does not have stock control", error, {
-        productId: message.productId,
-        productName: product.name,
-      });
-      throw error;
-    }
+    processingTracker.finishWithError(error);
+    throw error;
+  }
+}
 
-    let updateExpression: string;
-    let conditionExpression: string;
-    const expressionAttributeValues: any = {
-      ":quantity": message.quantity,
-      ":updatedAt": new Date().toISOString(),
-    };
+function validateProductForStockUpdate(
+  product: ProductData | null,
+  message: StockUpdateMessage,
+  logger: StructuredLogger
+): void {
+  if (!product) {
+    const error = new Error(`Product not found: ${message.productId}`);
+    logger.error("Product not found for stock update", error, {
+      productId: message.productId,
+    });
+    throw error;
+  }
 
-    if (message.operation === StockOperationType.DECREASE) {
-      updateExpression =
-        "SET quantityInStock = quantityInStock - :quantity, updatedAt = :updatedAt";
-      conditionExpression =
-        "quantityInStock >= :quantity AND isActive = :isActive";
-      expressionAttributeValues[":isActive"] = true;
+  if (!product.isActive) {
+    const error = new Error(`Product is inactive: ${message.productId}`);
+    logger.error("Cannot update stock for inactive product", error, {
+      productId: message.productId,
+      productName: product.name,
+      isActive: product.isActive,
+    });
+    throw error;
+  }
 
-      logger.info("Preparing stock reduction", {
-        productId: message.productId,
-        productName: product.name,
-        currentStock: product.quantityInStock,
-        quantityToReduce: message.quantity,
-        finalStock: product.quantityInStock - message.quantity,
-      });
-    } else if (message.operation === StockOperationType.INCREASE) {
-      updateExpression =
-        "SET quantityInStock = quantityInStock + :quantity, updatedAt = :updatedAt";
-      conditionExpression = "isActive = :isActive";
-      expressionAttributeValues[":isActive"] = true;
+  if (product.quantityInStock === undefined) {
+    const error = new Error(
+      `Product ${product.name} does not have stock control (quantityInStock property missing)`
+    );
+    logger.error("Product does not have stock control", error, {
+      productId: message.productId,
+      productName: product.name,
+      hasStockControl: false,
+    });
+    throw error;
+  }
 
-      logger.info("Preparing stock addition", {
-        productId: message.productId,
-        productName: product.name,
-        currentStock: product.quantityInStock,
-        quantityToAdd: message.quantity,
-        finalStock: product.quantityInStock + message.quantity,
-      });
-    } else {
-      const error = new Error(
-        `Invalid operation type: ${message.operation}. Must be DECREASE or INCREASE`
-      );
-      logger.error("Invalid stock operation type", error, {
-        productId: message.productId,
-        operation: message.operation,
-      });
-      throw error;
-    }
+  logger.info("Product validation successful", {
+    productId: message.productId,
+    productName: product.name,
+    isActive: product.isActive,
+    currentStock: product.quantityInStock,
+    hasStockControl: true,
+  });
+}
+
+async function executeStockUpdate(
+  product: ProductData,
+  message: StockUpdateMessage,
+  logger: StructuredLogger
+): Promise<StockUpdateResult> {
+  const updateTracker = new PerformanceTracker(logger, "dynamo-stock-update");
+
+  try {
+    const { updateExpression, conditionExpression, expressionAttributeValues } = 
+      buildUpdateParameters(product, message, logger);
 
     const updateCommand = new UpdateCommand({
       TableName: PRODUCT_TABLE_NAME,
       Key: {
-        productId: message.productId,
+        id: message.productId,
       },
       UpdateExpression: updateExpression,
       ConditionExpression: conditionExpression,
@@ -231,28 +256,47 @@ async function updateProductStock(
       ReturnValues: "ALL_NEW",
     });
 
+    logger.info("Executing stock update in DynamoDB", {
+      productId: message.productId,
+      operation: message.operation,
+      quantity: message.quantity,
+      currentStock: product.quantityInStock,
+    });
+
     const result = await docClient.send(updateCommand);
+    const newStock = result.Attributes?.quantityInStock as number;
+
+    const stockUpdateResult: StockUpdateResult = {
+      productId: message.productId,
+      previousStock: product.quantityInStock!,
+      newStock,
+      operation: message.operation,
+      quantity: message.quantity,
+    };
 
     updateTracker.finish({
       productId: message.productId,
       operation: message.operation,
       quantity: message.quantity,
       previousStock: product.quantityInStock,
-      newStock: result.Attributes?.quantityInStock as number,
+      newStock,
     });
 
-    logger.info("Stock updated successfully", {
+    logger.info("Stock updated successfully in DynamoDB", {
       productId: message.productId,
       productName: product.name,
       operation: message.operation,
       previousStock: product.quantityInStock,
-      newStock: result.Attributes?.quantityInStock as number,
+      newStock,
       quantityChanged: message.quantity,
       orderId: message.orderId,
       reason: message.reason,
     });
+
+    return stockUpdateResult;
+
   } catch (error: any) {
-    logger.error("Failed to update product stock", error, {
+    logger.error("Failed to update product stock in DynamoDB", error, {
       productId: message.productId,
       operation: message.operation,
       quantity: message.quantity,
@@ -263,39 +307,101 @@ async function updateProductStock(
     updateTracker.finishWithError(error);
 
     if (error.name === "ConditionalCheckFailedException") {
-      if (message.operation === StockOperationType.DECREASE) {
-        throw new Error(
-          `Insufficient stock for product ${message.productId}. Cannot reduce stock by ${message.quantity}.`
-        );
-      } else {
-        throw new Error(
-          `Cannot update stock for product ${message.productId}. Product may be inactive.`
-        );
-      }
+      throw createConditionalCheckError(message);
     }
 
     throw error;
   }
 }
 
+function buildUpdateParameters(
+  product: ProductData,
+  message: StockUpdateMessage,
+  logger: StructuredLogger
+): {
+  updateExpression: string;
+  conditionExpression: string;
+  expressionAttributeValues: Record<string, any>;
+} {
+  const expressionAttributeValues: Record<string, any> = {
+    ":quantity": message.quantity,
+    ":updatedAt": new Date().toISOString(),
+    ":isActive": true,
+  };
+
+  let updateExpression: string;
+  let conditionExpression: string;
+
+  if (message.operation === StockOperationType.DECREASE) {
+    updateExpression =
+      "SET quantityInStock = quantityInStock - :quantity, updatedAt = :updatedAt";
+    conditionExpression =
+      "quantityInStock >= :quantity AND isActive = :isActive";
+
+    logger.info("Preparing stock reduction", {
+      productId: message.productId,
+      productName: product.name,
+      currentStock: product.quantityInStock,
+      quantityToReduce: message.quantity,
+      projectedStock: product.quantityInStock! - message.quantity,
+    });
+
+  } else if (message.operation === StockOperationType.INCREASE) {
+    updateExpression =
+      "SET quantityInStock = quantityInStock + :quantity, updatedAt = :updatedAt";
+    conditionExpression = "isActive = :isActive";
+
+    logger.info("Preparing stock addition", {
+      productId: message.productId,
+      productName: product.name,
+      currentStock: product.quantityInStock,
+      quantityToAdd: message.quantity,
+      projectedStock: product.quantityInStock! + message.quantity,
+    });
+
+  } else {
+    throw new Error(
+      `Invalid operation type: ${message.operation}. Must be DECREASE or INCREASE`
+    );
+  }
+
+  return {
+    updateExpression,
+    conditionExpression,
+    expressionAttributeValues,
+  };
+}
+
+function createConditionalCheckError(message: StockUpdateMessage): Error {
+  if (message.operation === StockOperationType.DECREASE) {
+    return new Error(
+      `Insufficient stock for product ${message.productId}. Cannot reduce stock by ${message.quantity}.`
+    );
+  } else {
+    return new Error(
+      `Cannot update stock for product ${message.productId}. Product may be inactive.`
+    );
+  }
+}
+
 async function getProductById(
   productId: string,
-  logger: any
-): Promise<Product | null> {
-  const productTracker = new PerformanceTracker(logger, "product-lookup");
+  logger: StructuredLogger
+): Promise<ProductData | null> {
+  const lookupTracker = new PerformanceTracker(logger, "product-lookup");
 
   try {
     logger.info("Looking up product for stock update", {
-      productId: productId,
+      productId,
     });
 
     const getCommand = new GetCommand({
       TableName: PRODUCT_TABLE_NAME,
       Key: {
-        productId: productId,
+        id: productId,
       },
       ProjectionExpression:
-        "productId, #name, price, category, description, isActive, quantityInStock",
+        "id, #name, price, category, description, isActive, quantityInStock",
       ExpressionAttributeNames: {
         "#name": "name",
       },
@@ -304,49 +410,54 @@ async function getProductById(
     const result = await docClient.send(getCommand);
 
     if (result.Item) {
-      const product: Product = {
-        productId: result.Item.productId as string,
-        name: result.Item.name as string,
-        price: result.Item.price as number,
-        category: result.Item.category as string,
-        description: result.Item.description as string,
-        isActive: result.Item.isActive as boolean,
-        quantityInStock: result.Item.quantityInStock as number | undefined,
-      };
+      const product = mapDynamoItemToProduct(result.Item);
+
+      lookupTracker.finish({
+        productId,
+        found: true,
+        hasStockControl: product.quantityInStock !== undefined,
+        isActive: product.isActive,
+      });
 
       logger.info("Product found for stock update", {
-        productId: productId,
+        productId,
         productName: product.name,
         isActive: product.isActive,
         hasStockControl: product.quantityInStock !== undefined,
         currentStock: product.quantityInStock,
       });
 
-      productTracker.finish({
-        productId: productId,
-        found: true,
-        hasStockControl: product.quantityInStock !== undefined,
-      });
-
       return product;
     } else {
-      logger.warn("Product not found for stock update", {
-        productId: productId,
+      lookupTracker.finish({
+        productId,
+        found: false,
       });
 
-      productTracker.finish({
-        productId: productId,
-        found: false,
+      logger.warn("Product not found for stock update", {
+        productId,
       });
 
       return null;
     }
-  } catch (error) {
+  } catch (error: any) {
     logger.error("Error looking up product for stock update", error, {
-      productId: productId,
+      productId,
+      errorType: error.constructor.name,
     });
 
-    productTracker.finishWithError(error);
+    lookupTracker.finishWithError(error);
     throw error;
   }
+}
+
+function mapDynamoItemToProduct(item: any): ProductData {
+  return {
+    id: item.id as string,
+    name: item.name as string,
+    price: item.price as number,
+    description: item.description as string,
+    isActive: item.isActive as boolean,
+    quantityInStock: item.quantityInStock as number | undefined,
+  };
 }

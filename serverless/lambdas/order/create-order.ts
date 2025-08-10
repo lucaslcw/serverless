@@ -27,6 +27,7 @@ import {
 import { TransactionMessage } from "../transaction/process-transaction";
 import { LeadData } from "../../shared/schemas/lead";
 import { ProductData } from "../../shared/schemas/product";
+import { StockOperationType, StockUpdateMessage } from "../product/update-product-stock";
 
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
 const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
@@ -38,19 +39,6 @@ const PRODUCT_TABLE_NAME = process.env.PRODUCT_COLLECTION_TABLE!;
 const PRODUCT_STOCK_QUEUE_URL = process.env.PRODUCT_STOCK_QUEUE_URL!;
 const PROCESS_TRANSACTION_QUEUE_URL =
   process.env.PROCESS_TRANSACTION_QUEUE_URL!;
-
-enum StockOperationType {
-  DECREASE = "DECREASE",
-  INCREASE = "INCREASE",
-}
-
-interface StockUpdateMessage {
-  productId: string;
-  quantity: number;
-  operation: StockOperationType;
-  orderId?: string;
-  reason?: string;
-}
 
 type ExistingLead = Pick<
   LeadData,

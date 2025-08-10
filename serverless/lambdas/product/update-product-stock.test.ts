@@ -1,5 +1,5 @@
 import { SQSEvent, SQSRecord } from "aws-lambda";
-import { handler } from "../product/update-product-stock";
+import { handler, StockOperationType, StockUpdateMessage } from "./update-product-stock";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import {
   createLogger,
@@ -71,11 +71,11 @@ describe("update-product-stock handler", () => {
 
     mockSend.mockImplementation((command: any) => {
       if (command.constructor.name === "GetCommand") {
-        const productId = command.input?.Key?.productId;
+        const productId = command.input?.Key?.id;
         if (productId === "product-with-stock") {
           return Promise.resolve({
             Item: {
-              productId: "product-with-stock",
+              id: "product-with-stock",
               name: "Produto com Estoque",
               price: 50.0,
               category: "electronics",
@@ -86,7 +86,7 @@ describe("update-product-stock handler", () => {
         } else if (productId === "product-without-stock") {
           return Promise.resolve({
             Item: {
-              productId: "product-without-stock",
+              id: "product-without-stock",
               name: "Produto sem Estoque",
               price: 30.0,
               category: "digital",
@@ -96,7 +96,7 @@ describe("update-product-stock handler", () => {
         } else if (productId === "inactive-product") {
           return Promise.resolve({
             Item: {
-              productId: "inactive-product",
+              id: "inactive-product",
               name: "Produto Inativo",
               price: 25.0,
               category: "tools",
@@ -109,7 +109,7 @@ describe("update-product-stock handler", () => {
       }
 
       if (command.constructor.name === "UpdateCommand") {
-        const productId = command.input?.Key?.productId;
+        const productId = command.input?.Key?.id;
         const quantity =
           command.input?.ExpressionAttributeValues?.[":quantity"];
         const updateExpression = command.input?.UpdateExpression;
@@ -125,7 +125,7 @@ describe("update-product-stock handler", () => {
 
         return Promise.resolve({
           Attributes: {
-            productId: productId,
+            id: productId,
             quantityInStock: newStock,
             updatedAt: new Date().toISOString(),
           },
@@ -181,13 +181,14 @@ describe("update-product-stock handler", () => {
       );
 
       expect(mockLogger.info).toHaveBeenCalledWith(
-        "Stock update completed successfully",
-        {
+        "Stock update processing completed successfully",
+        expect.objectContaining({
           productId: "product-with-stock",
-          operation: "DECREASE",
-          quantity: 5,
-          orderId: "order-123",
-        }
+          operation: StockOperationType.DECREASE,
+          previousStock: 100,
+          newStock: 95,
+          quantityChanged: 5,
+        })
       );
 
       expect(mockSend).toHaveBeenCalledTimes(2);
@@ -205,14 +206,14 @@ describe("update-product-stock handler", () => {
       await handler(mockEvent);
 
       expect(mockLogger.info).toHaveBeenCalledWith(
-        "Stock update message parsed successfully",
-        {
+        "Starting stock update processing",
+        expect.objectContaining({
           productId: "product-with-stock",
-          operation: "INCREASE",
+          operation: StockOperationType.INCREASE,
           quantity: 10,
           orderId: "order-123",
           reason: "Stock rollback",
-        }
+        })
       );
 
       expect(mockSend).toHaveBeenCalledTimes(2);
@@ -264,18 +265,28 @@ describe("update-product-stock handler", () => {
       mockEvent.Records[0].body = JSON.stringify({
         productId: "non-existent-product",
         quantity: 5,
-        operation: "BAIXA",
+        operation: "DECREASE",
         orderId: "order-123",
+        reason: "Order processing",
       });
 
-      await expect(handler(mockEvent)).rejects.toThrow(
-        "Product not found: non-existent-product"
-      );
+      await handler(mockEvent);
 
       expect(mockLogger.error).toHaveBeenCalledWith(
         "Product not found for stock update",
         expect.any(Error),
         { productId: "non-existent-product" }
+      );
+
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        "Stock update processing failed",
+        expect.any(Error),
+        expect.objectContaining({
+          productId: "non-existent-product",
+          operation: "DECREASE",
+          quantity: 5,
+          orderId: "order-123",
+        })
       );
     });
 
@@ -283,21 +294,21 @@ describe("update-product-stock handler", () => {
       mockEvent.Records[0].body = JSON.stringify({
         productId: "inactive-product",
         quantity: 5,
-        operation: "BAIXA",
+        operation: "DECREASE",
         orderId: "order-123",
+        reason: "Order processing",
       });
 
-      await expect(handler(mockEvent)).rejects.toThrow(
-        "Product is inactive: inactive-product"
-      );
+      await handler(mockEvent);
 
       expect(mockLogger.error).toHaveBeenCalledWith(
         "Cannot update stock for inactive product",
         expect.any(Error),
-        {
+        expect.objectContaining({
           productId: "inactive-product",
           productName: "Produto Inativo",
-        }
+          isActive: false,
+        })
       );
     });
 
@@ -305,21 +316,21 @@ describe("update-product-stock handler", () => {
       mockEvent.Records[0].body = JSON.stringify({
         productId: "product-without-stock",
         quantity: 5,
-        operation: "BAIXA",
+        operation: "DECREASE",
         orderId: "order-123",
+        reason: "Order processing",
       });
 
-      await expect(handler(mockEvent)).rejects.toThrow(
-        "Product Produto sem Estoque does not have stock control (quantityInStock property missing)"
-      );
+      await handler(mockEvent);
 
       expect(mockLogger.error).toHaveBeenCalledWith(
         "Product does not have stock control",
         expect.any(Error),
-        {
+        expect.objectContaining({
           productId: "product-without-stock",
           productName: "Produto sem Estoque",
-        }
+          hasStockControl: false,
+        })
       );
     });
 
@@ -329,10 +340,18 @@ describe("update-product-stock handler", () => {
         quantity: 5,
         operation: "INVALID_OPERATION",
         orderId: "order-123",
+        reason: "Order processing",
       });
 
-      await expect(handler(mockEvent)).rejects.toThrow(
-        "Invalid operation type: INVALID_OPERATION. Must be DECREASE or INCREASE"
+      await handler(mockEvent);
+
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        "Error processing stock update record",
+        expect.any(Error),
+        expect.objectContaining({
+          errorType: "Error",
+          recordIndex: 0,
+        })
       );
     });
 
@@ -341,7 +360,7 @@ describe("update-product-stock handler", () => {
         if (command.constructor.name === "GetCommand") {
           return Promise.resolve({
             Item: {
-              productId: "product-with-stock",
+              id: "product-with-stock",
               name: "Produto com Estoque",
               price: 50.0,
               category: "electronics",
@@ -360,20 +379,40 @@ describe("update-product-stock handler", () => {
         return Promise.resolve({});
       });
 
-      await expect(handler(mockEvent)).rejects.toThrow(
-        "Insufficient stock for product product-with-stock. Cannot reduce stock by 5."
+      await handler(mockEvent);
+
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        "Failed to update product stock in DynamoDB",
+        expect.any(Error),
+        expect.objectContaining({
+          productId: "product-with-stock",
+          operation: "DECREASE",
+          quantity: 5,
+          errorName: "ConditionalCheckFailedException",
+        })
+      );
+
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        "Stock update processing failed",
+        expect.any(Error),
+        expect.objectContaining({
+          productId: "product-with-stock",
+        })
       );
     });
 
     test("should handle invalid JSON in message body", async () => {
       mockEvent.Records[0].body = "invalid-json";
 
-      await expect(handler(mockEvent)).rejects.toThrow();
+      await handler(mockEvent);
 
       expect(mockLogger.error).toHaveBeenCalledWith(
         "Error processing stock update record",
         expect.any(Error),
-        { sqsMessagePreview: "invalid-json" }
+        expect.objectContaining({
+          sqsMessagePreview: "invalid-json",
+          errorType: "SyntaxError",
+        })
       );
     });
   });
@@ -385,6 +424,7 @@ describe("update-product-stock handler", () => {
         quantity: 5,
         operation: "DECREASE",
         orderId: "order-123",
+        reason: "Order processing",
       });
 
       await handler(mockEvent);
@@ -393,6 +433,7 @@ describe("update-product-stock handler", () => {
         (call: any) => call[0].constructor.name === "UpdateCommand"
       );
 
+      expect(updateCall).toBeTruthy();
       expect(updateCall[0].input.UpdateExpression).toBe(
         "SET quantityInStock = quantityInStock - :quantity, updatedAt = :updatedAt"
       );
@@ -413,6 +454,7 @@ describe("update-product-stock handler", () => {
         quantity: 10,
         operation: "INCREASE",
         orderId: "order-123",
+        reason: "Stock rollback",
       });
 
       await handler(mockEvent);
@@ -421,6 +463,7 @@ describe("update-product-stock handler", () => {
         (call: any) => call[0].constructor.name === "UpdateCommand"
       );
 
+      expect(updateCall).toBeTruthy();
       expect(updateCall[0].input.UpdateExpression).toBe(
         "SET quantityInStock = quantityInStock + :quantity, updatedAt = :updatedAt"
       );
@@ -456,14 +499,24 @@ describe("update-product-stock handler", () => {
 
       expect(PerformanceTracker).toHaveBeenCalledWith(
         expect.objectContaining({ withContext: expect.any(Function) }),
-        "stock-update-logic"
+        "stock-update-processing"
+      );
+
+      expect(PerformanceTracker).toHaveBeenCalledWith(
+        expect.objectContaining({ withContext: expect.any(Function) }),
+        "dynamo-stock-update"
+      );
+
+      expect(PerformanceTracker).toHaveBeenCalledWith(
+        expect.objectContaining({ withContext: expect.any(Function) }),
+        "product-lookup"
       );
     });
 
     test("should track performance for failed records", async () => {
       mockEvent.Records[0].body = "invalid-json";
 
-      await expect(handler(mockEvent)).rejects.toThrow();
+      await handler(mockEvent);
 
       expect(mockTracker.finishWithError).toHaveBeenCalledWith(
         expect.any(Error)
@@ -482,8 +535,9 @@ describe("update-product-stock handler", () => {
 
       expect(mockLogger.withContext).toHaveBeenCalledWith({
         productId: "product-with-stock",
-        operation: "DECREASE",
+        operation: StockOperationType.DECREASE,
         quantity: 5,
+        orderId: "order-123",
       });
     });
 
@@ -491,17 +545,17 @@ describe("update-product-stock handler", () => {
       await handler(mockEvent);
 
       expect(mockLogger.info).toHaveBeenCalledWith(
-        "Stock updated successfully",
-        {
+        "Stock updated successfully in DynamoDB",
+        expect.objectContaining({
           productId: "product-with-stock",
           productName: "Produto com Estoque",
-          operation: "DECREASE",
+          operation: StockOperationType.DECREASE,
           previousStock: 100,
           newStock: 95,
           quantityChanged: 5,
           orderId: "order-123",
           reason: "Order processing",
-        }
+        })
       );
     });
   });
